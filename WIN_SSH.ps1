@@ -25,14 +25,14 @@ Write-Host "==========================================================" -Foregro
 
 # 4. Helper Function: Install via GitHub Zip (Server 2016 / 2012 R2 / Offline)
 function Install-OpenSSHFromZip {
-    Write-Host "[*] Installing OpenSSH via Microsoft Win32-OpenSSH package..." -ForegroundColor Yellow
+    Write-Host "[*] Windows Server 2016 detected. Installing via official Win32-OpenSSH package..." -ForegroundColor Yellow
     $targetDir   = "C:\Program Files\OpenSSH"
     $tempZip     = "$env:TEMP\OpenSSH-Win64.zip"
     $tempFolder  = "$env:TEMP\OpenSSH-Extract"
     $downloadUrl = "https://github.com/PowerShell/Win32-OpenSSH/releases/download/v9.5.0.0p1-Beta/OpenSSH-Win64.zip"
 
     try {
-        Write-Host "    -> Downloading package..."
+        Write-Host "    -> Downloading OpenSSH binary package..."
         Invoke-WebRequest -Uri $downloadUrl -OutFile $tempZip -UseBasicParsing
 
         Write-Host "    -> Extracting to $targetDir..."
@@ -42,7 +42,7 @@ function Install-OpenSSHFromZip {
         if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }
         Copy-Item -Path "$tempFolder\OpenSSH-Win64\*" -Destination $targetDir -Recurse -Force
 
-        Write-Host "    -> Registering services..."
+        Write-Host "    -> Registering sshd and ssh-agent services..."
         powershell.exe -ExecutionPolicy Bypass -File "$targetDir\install-sshd.ps1"
 
         # Add to PATH
@@ -66,16 +66,13 @@ function Install-OpenSSHFromZip {
 # 5. Determine Installation Route
 $installedSuccessfully = $false
 
-# Check if sshd service is already present
 if (Get-Service sshd -ErrorAction SilentlyContinue) {
-    Write-Host "[+] sshd service is already installed on this machine." -ForegroundColor Green
+    Write-Host "[+] sshd service is already present." -ForegroundColor Green
     $installedSuccessfully = $true
 }
-# Windows Server 2019 / 2022 / 2025 (Build 17763 or higher)
 elseif ($buildNumber -ge 17763) {
     Write-Host "[*] Modern OS detected. Trying Add-WindowsCapability..." -ForegroundColor Cyan
     try {
-        # Temporarily bypass WSUS if present
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "UseWUServer" -Value 0 -ErrorAction SilentlyContinue
         Restart-Service wuauserv -ErrorAction SilentlyContinue
 
@@ -84,13 +81,12 @@ elseif ($buildNumber -ge 17763) {
         Write-Host "[+] Installed successfully via Windows Capability." -ForegroundColor Green
     }
     catch {
-        Write-Warning "[!] Windows Capability install failed (WSUS or offline issue). Falling back to ZIP package..."
+        Write-Warning "[!] Capability install failed. Falling back to ZIP package..."
         $installedSuccessfully = Install-OpenSSHFromZip
     }
 }
-# Windows Server 2016 / 2012 R2 (Build below 17763)
 else {
-    Write-Host "[*] Legacy OS detected (Server 2016 or earlier). Capability not supported." -ForegroundColor Yellow
+    # Server 2016 falls here
     $installedSuccessfully = Install-OpenSSHFromZip
 }
 
@@ -100,10 +96,10 @@ if (-not $installedSuccessfully) {
 }
 
 # ==============================================================================
-# COMMON POST-INSTALL CONFIGURATION (All Server Versions)
+# POST-INSTALL CONFIGURATION
 # ==============================================================================
 
-# 6. Windows Defender Firewall (Port 22)
+# 6. Windows Firewall (Port 22)
 Write-Host "`n[*] Configuring Windows Firewall..." -ForegroundColor Cyan
 $fwRule = Get-NetFirewallRule -Name "*OpenSSH*Server*" -ErrorAction SilentlyContinue
 if (-not $fwRule) {
@@ -120,21 +116,21 @@ if (-not $fwRule) {
     Write-Host "[+] OpenSSH firewall rule is active." -ForegroundColor Green
 }
 
-# 7. Default Shell: PowerShell (instead of cmd.exe)
+# 7. Default Shell: PowerShell
 Write-Host "[*] Setting default shell to PowerShell..." -ForegroundColor Cyan
 $regPath = "HKLM:\SOFTWARE\OpenSSH"
 if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
 New-ItemProperty -Path $regPath -Name "DefaultShell" -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -PropertyType String -Force | Out-Null
 
-# 8. Start & Configure Services
-Write-Host "[*] Configuring and starting services..." -ForegroundColor Cyan
+# 8. Start Services
+Write-Host "[*] Starting services..." -ForegroundColor Cyan
 Set-Service -Name sshd -StartupType Automatic
 Set-Service -Name "ssh-agent" -StartupType Automatic
 Start-Service sshd -ErrorAction SilentlyContinue
 Start-Service "ssh-agent" -ErrorAction SilentlyContinue
 
-# 9. Configure Domain Controller Admin Key File & Permissions
-Write-Host "[*] Setting up administrators_authorized_keys with strict DC ACLs..." -ForegroundColor Cyan
+# 9. Configure Domain Controller Admin Key File
+Write-Host "[*] Configuring administrators_authorized_keys permissions..." -ForegroundColor Cyan
 $sshDataDir = "$env:ProgramData\ssh"
 $adminKeysFile = "$sshDataDir\administrators_authorized_keys"
 
@@ -143,8 +139,8 @@ if (-not (Test-Path $adminKeysFile)) { New-Item -ItemType File -Path $adminKeysF
 
 $acl = Get-Acl $adminKeysFile
 $acl.SetAccessRuleProtection($true, $false)
-$adminGroup    = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544") # BUILTIN\Administrators
-$systemAccount = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")    # NT AUTHORITY\SYSTEM
+$adminGroup    = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+$systemAccount = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
 $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminGroup, "FullControl", "Allow")))
 $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemAccount, "FullControl", "Allow")))
 Set-Acl -Path $adminKeysFile -AclObject $acl
@@ -155,5 +151,4 @@ Restart-Service sshd
 Write-Host "`n================ SETUP COMPLETED ================" -ForegroundColor Green
 Write-Host "[+] Service status: $((Get-Service sshd).Status)" -ForegroundColor Green
 Write-Host "[+] Listening Port: 22" -ForegroundColor Green
-Write-Host "[+] Default Shell:  PowerShell" -ForegroundColor Green
 Write-Host "=================================================" -ForegroundColor Green
