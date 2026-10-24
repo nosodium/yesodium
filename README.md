@@ -21,7 +21,7 @@ HardenTest2:
 
 Download:
 ```shell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main/HardenTest2.ps1' -OutFile \"$env:USERPROFILE\Desktop\harden.ps1\" -UseBasicParsing"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main/HardenTest2.ps1' -OutFile \"$env:USERPROFILE\Desktop\DCHardening.ps1\" -UseBasicParsing"
 ```
 
 Dry Run:
