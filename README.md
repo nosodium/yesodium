@@ -26,25 +26,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[System.Net.ServiceP
 
 Dry Run:
 ```shell
-# 1. Audit-Only Mode: Scans settings and DCSync rights, changes nothing
-.\DCHardening.ps1 -AuditOnly
+cd Desktop
+.\DCHardening.ps1 -MonitorFirewall
 
-# 2. WhatIf Simulation: Simulates execution and shows every registry/firewall change that would occur
-.\DCHardening.ps1 -WhatIf
-```
-
-Enforce:
-```shell
-.\DCHardening.ps1 | Tee-Object -FilePath "C:\DCHardening_Execution.log"
-```
-
-View Script Execution Logs:
-```shell
-Get-Content -Path "C:\DCHardening_Execution.log" -Tail 50
-```
-
-View Firewall Logs:
-```shell
-# View the live firewall log stream:
-Get-Content -Path "$env:SystemRoot\System32\LogFiles\Firewall\pfirewall.log" -Tail 30 -Wait
+# Once Hardened and want to view Traffic:
+.\DCHardening.ps1 -MonitorFirewall -AuditOnly
 ```
