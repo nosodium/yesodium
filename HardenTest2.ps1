@@ -3,6 +3,9 @@ param (
     [Parameter(Mandatory = $false, HelpMessage = "Perform non-destructive discovery and configuration verification only.")]
     [switch]$AuditOnly,
 
+    [Parameter(Mandatory = $false, HelpMessage = "Immediately start the real-time Red Team firewall monitor after hardening.")]
+    [switch]$MonitorFirewall,
+
     [Parameter(Mandatory = $false, HelpMessage = "Roll back configuration to a previously captured state file.")]
     [switch]$Rollback,
 
@@ -184,6 +187,61 @@ function Get-HostOSProfile {
     }
 }
 
+function Start-RedTeamFirewallMonitor {
+    [CmdletBinding()]
+    param (
+        [string]$LogPath = "C:\Windows\System32\LogFiles\Firewall\pfirewall.log"
+    )
+
+    if (-not (Test-Path $LogPath)) {
+        Write-HardeningLog -Message "Firewall log file not found at $LogPath. Generating network traffic to force log creation..." -Level 'WARN'
+        $null = Test-NetConnection -ComputerName 127.0.0.1 -Port 445 -WarningAction SilentlyContinue
+        Start-Sleep -Seconds 1
+    }
+
+    if (-not (Test-Path $LogPath)) {
+        Write-HardeningLog -Message "Log file has not yet been initialized by Windows Firewall service." -Level 'ERROR'
+        return
+    }
+
+    Write-Host "`n==========================================================================================" -ForegroundColor Cyan
+    Write-Host "                ACTIVE DIRECTORY FIREWALL: REAL-TIME RED TEAM MONITOR                     " -ForegroundColor Cyan
+    Write-Host "==========================================================================================" -ForegroundColor Cyan
+    Write-Host "Streaming $LogPath (Press Ctrl+C to terminate live feed)`n" -ForegroundColor DarkGray
+    Write-Host ("{0,-20} {1,-6} {2,-8} {3,-22} {4,-22} {5,-6} {6,-6} {7}" -f "Date/Time", "Action", "Proto", "SourceIP", "DestIP", "SPort", "DPort", "Direction") -ForegroundColor Yellow
+    Write-Host "----------------------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
+
+    Get-Content -Path $LogPath -Tail 25 -Wait | ForEach-Object {
+        if ($_ -match "^#" -or [string]::IsNullOrWhiteSpace($_)) { return }
+
+        $f = $_ -split '\s+'
+        if ($f.Count -ge 16) {
+            $date      = $f[0] + " " + $f[1]
+            $action    = $f[2]
+            $proto     = $f[3]
+            $srcIp     = $f[4]
+            $dstIp     = $f[5]
+            $srcPort   = $f[6]
+            $dstPort   = $f[7]
+            $direction = $f[15]
+
+            # Filter out benign loopback, link-local, and broadcast chatter
+            if ($srcIp -match '^(127\.0\.0\.1|::1|fe80:)' -or $dstIp -match '^(127\.0\.0\.1|::1|224\.0\.0\.252|ff02:)') {
+                return
+            }
+
+            $line = "{0,-20} {1,-6} {2,-8} {3,-22} {4,-22} {5,-6} {6,-6} {7}" -f $date, $action, $proto, $srcIp, $dstIp, $srcPort, $dstPort, $direction
+
+            # Highlight DROPs (Blocked probes, port scans, and cut-off beacons) in Bright Red
+            if ($action -eq "DROP") {
+                Write-Host $line -ForegroundColor Red
+            } else {
+                Write-Host $line -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+
 #endregion
 
 #region Pre-Execution Flight Checks
@@ -272,7 +330,7 @@ if ($Rollback) {
         }
 
         # Remove custom LOLBAS outbound firewall rules created during hardening
-        $lolbasBinaries = @('mshta.exe', 'wscript.exe', 'cscript.exe', 'regsvr32.exe', 'hh.exe')
+        $lolbasBinaries = @('mshta.exe', 'wscript.exe', 'cscript.exe', 'regsvr32.exe', 'hh.exe', 'certutil.exe', 'bitsadmin.exe')
         foreach ($bin in $lolbasBinaries) {
             $ruleName = "Block Outbound $bin"
             if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
@@ -337,7 +395,6 @@ catch {
 
 #region Component 2: Mandatory Security Lockdown (NTLMv2, SMB Signing, Netlogon)
 # Server [2012, 2012R2, 2016, 2019, 2022, 2025]
-# Enforces NTLMv2 only, requires SMB Signing, encrypts Netlogon secure channel, and stops cleartext caching.
 Write-HardeningLog -Message "Executing Component 2: Mandatory Security Lockdown..." -Level 'INFO'
 
 $wdigestRegistryPath     = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest'
@@ -351,7 +408,7 @@ try {
         # WDigest cleartext mitigation
         Set-RegistryValueSafely -Path $wdigestRegistryPath -Name 'UseLogonCredential' -Value 0 -PropertyType DWord
 
-        # Enforce NTLMv2 Only; Refuse LM & NTLMv1 (LmCompatibilityLevel = 5)
+        # Enforce NTLMv2 Only; Refuse LM & NTLMv1
         Set-RegistryValueSafely -Path $lsaRegistryPath -Name 'LmCompatibilityLevel' -Value 5 -PropertyType DWord
 
         # Restrict Anonymous SAM and Enumeration
@@ -359,12 +416,12 @@ try {
         Set-RegistryValueSafely -Path $lsaRegistryPath -Name 'RestrictAnonymousSAM' -Value 1 -PropertyType DWord
         Set-RegistryValueSafely -Path $lsaRegistryPath -Name 'EveryoneIncludesAnonymous' -Value 0 -PropertyType DWord
 
-        # Require SMB Server & Workstation Packet Signing (Prevents SMB Relay/MitM attacks)
+        # Require SMB Server & Workstation Packet Signing
         Set-RegistryValueSafely -Path $lanmanServerParamPath -Name 'RequireSecuritySignature' -Value 1 -PropertyType DWord
         Set-RegistryValueSafely -Path $lanmanServerParamPath -Name 'EnableSecuritySignature' -Value 1 -PropertyType DWord
         Set-RegistryValueSafely -Path $lanmanWorkstationParam -Name 'RequireSecuritySignature' -Value 1 -PropertyType DWord
 
-        # Disable Insecure Guest Logons on SMB Workstation redirector
+        # Disable Insecure Guest Logons
         Set-RegistryValueSafely -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\LanmanWorkstation' -Name 'AllowInsecureGuestAuth' -Value 0 -PropertyType DWord
 
         # Netlogon Secure Channel: Force Encryption and Signing
@@ -390,7 +447,6 @@ catch {
 
 #region Component 3: Advanced Logging, Event Log Sizing & Audit Policies
 # Server [2012, 2012R2, 2016, 2019, 2022, 2025]
-# Prioritizes Advanced Audit Subcategories, enables Command-Line & ScriptBlock logging, expands log buffers.
 Write-HardeningLog -Message "Executing Component 3: Advanced Logging & Security Audit Configuration..." -Level 'INFO'
 
 $auditPolicyPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
@@ -408,7 +464,7 @@ try {
         Set-RegistryValueSafely -Path $psPolicyPath -Name 'EnableScriptBlockLogging' -Value 1 -PropertyType DWord
         Set-RegistryValueSafely -Path $psPolicyPath -Name 'EnableModuleLogging' -Value 1 -PropertyType DWord
 
-        # Increase Event Log Sizes to 1GB to prevent rollover during forensic investigations
+        # Increase Event Log Sizes to 1GB
         $logNames = @('Security', 'System', 'Application', 'Microsoft-Windows-PowerShell/Operational')
         foreach ($log in $logNames) {
             $wevtutil = Join-Path -Path $env:SystemRoot -ChildPath 'System32\wevtutil.exe'
@@ -419,21 +475,21 @@ try {
             }
         }
 
-        # Enforce Fine-Grained Advanced Subcategory Auditing via auditpol.exe
+        # Enforce Fine-Grained Advanced Subcategory Auditing
         $auditpol = Join-Path -Path $env:SystemRoot -ChildPath 'System32\auditpol.exe'
         if (Test-Path $auditpol) {
             $auditSettings = @(
-                @{ Sub = "Credential Validation";               Succ = "enable"; Fail = "enable" }, # Event 4776
-                @{ Sub = "Kerberos Service Ticket Operations";  Succ = "enable"; Fail = "enable" }, # Event 4769 (Kerberoast)
-                @{ Sub = "Kerberos Authentication Service";     Succ = "enable"; Fail = "enable" }, # Event 4768 / 4771 (AS-REP)
-                @{ Sub = "Process Creation";                    Succ = "enable"; Fail = "disable" },# Event 4688
-                @{ Sub = "Security Group Management";           Succ = "enable"; Fail = "enable" }, # Event 4728, 4732
-                @{ Sub = "User Account Management";             Succ = "enable"; Fail = "enable" }, # Event 4720, 4722
-                @{ Sub = "Security System Extension";           Succ = "enable"; Fail = "enable" }, # LSA extension loading
-                @{ Sub = "System Integrity";                    Succ = "enable"; Fail = "enable" }, # Driver/code integrity
-                @{ Sub = "Sensitive Privilege Use";             Succ = "enable"; Fail = "enable" }, # Event 4672
-                @{ Sub = "Directory Service Access";            Succ = "enable"; Fail = "enable" }, # Event 4662 (AD object reads)
-                @{ Sub = "Directory Service Changes";           Succ = "enable"; Fail = "enable" }  # Event 5136 (AD modifications)
+                @{ Sub = "Credential Validation";               Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Kerberos Service Ticket Operations";  Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Kerberos Authentication Service";     Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Process Creation";                    Succ = "enable"; Fail = "disable" },
+                @{ Sub = "Security Group Management";           Succ = "enable"; Fail = "enable" },
+                @{ Sub = "User Account Management";             Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Security System Extension";           Succ = "enable"; Fail = "enable" },
+                @{ Sub = "System Integrity";                    Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Sensitive Privilege Use";             Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Directory Service Access";            Succ = "enable"; Fail = "enable" },
+                @{ Sub = "Directory Service Changes";           Succ = "enable"; Fail = "enable" }
             )
 
             foreach ($setting in $auditSettings) {
@@ -456,26 +512,30 @@ catch {
 
 #region Component 4: Windows Firewall Hardening & LOLBAS Outbound Mitigations
 # Server [2012, 2012R2, 2016, 2019, 2022, 2025]
-# Enables Firewall across Domain, Private, and Public profiles, enables logging, and blocks LOLBAS outbound beacons.
 Write-HardeningLog -Message "Executing Component 4: Windows Firewall & LOLBAS Egress Hardening..." -Level 'INFO'
 
 try {
     if (-not $AuditOnly) {
-        # 1. Enable Windows Firewall for all profiles
+        # 1. Enable Windows Firewall across all profiles
         if ($PSCmdlet.ShouldProcess("Firewall Profiles", "Enable Domain, Private, Public")) {
             Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -ErrorAction Stop
             Write-HardeningLog -Message "Windows Firewall enabled for Domain, Private, and Public profiles." -Level 'SUCCESS'
         }
 
-        # 2. Configure Firewall Diagnostic Logging to pfirewall.log (16MB buffer)
-        $fwLogPath = Join-Path -Path $env:SystemRoot -ChildPath 'System32\LogFiles\Firewall\pfirewall.log'
-        if ($PSCmdlet.ShouldProcess("Firewall Logging", "Enable logging dropped and allowed connections to $fwLogPath")) {
-            Set-NetFirewallProfile -Profile Domain, Private, Public -LogFileName $fwLogPath -LogMaxSizeKilobytes 16384 -LogAllowed True -LogBlocked True -ErrorAction SilentlyContinue
-            Write-HardeningLog -Message "Configured Windows Firewall connection logging: $fwLogPath" -Level 'SUCCESS'
+        # 2. Configure Firewall Logging: DROP traffic only (Eliminates noise, saves disk I/O)
+        $fwLogDir = Join-Path -Path $env:SystemRoot -ChildPath 'System32\LogFiles\Firewall'
+        if (-not (Test-Path $fwLogDir)) {
+            $null = New-Item -Path $fwLogDir -ItemType Directory -Force
+        }
+        $fwLogPath = Join-Path -Path $fwLogDir -ChildPath 'pfirewall.log'
+
+        if ($PSCmdlet.ShouldProcess("Firewall Logging", "Configure Drop-Only logging to $fwLogPath")) {
+            Set-NetFirewallProfile -Profile Domain, Private, Public -LogFileName $fwLogPath -LogMaxSizeKilobytes 16384 -LogAllowed False -LogBlocked True -ErrorAction SilentlyContinue
+            Write-HardeningLog -Message "Configured Windows Firewall drop-only logging: $fwLogPath" -Level 'SUCCESS'
         }
 
-        # 3. Block Living-Off-The-Land Binaries (LOLBAS) from making outbound network connections
-        $lolbasBinaries = @('mshta.exe', 'wscript.exe', 'cscript.exe', 'regsvr32.exe', 'hh.exe')
+        # 3. Block Living-Off-The-Land Binaries (LOLBAS) from outbound network sockets
+        $lolbasBinaries = @('mshta.exe', 'wscript.exe', 'cscript.exe', 'regsvr32.exe', 'hh.exe', 'certutil.exe', 'bitsadmin.exe')
         foreach ($bin in $lolbasBinaries) {
             $ruleName = "Block Outbound $bin"
             $binPath = Join-Path -Path $env:SystemRoot -ChildPath "System32\$bin"
@@ -503,9 +563,7 @@ catch {
 #endregion
 
 #region Component 5: Local Administrator Password Solution (LAPS) Assessment
-# Server [2012, 2012R2, 2016] - Relies on Legacy LAPS (AdmPwd.dll CSE).
-# Server [2019, 2022]        - Supports Legacy LAPS OR Native Windows LAPS.
-# Server [2025]              - Built-in Native Windows LAPS with DSRM synchronization.
+# Server [2012, 2012R2, 2016, 2019, 2022, 2025]
 Write-HardeningLog -Message "Executing Component 5: LAPS Architecture & Feature Detection..." -Level 'INFO'
 
 try {
@@ -526,12 +584,10 @@ try {
     Write-HardeningLog -Message "LAPS Status: Native LAPS = $hasNativeLaps | Legacy AdmPwd = $hasLegacyLaps" -Level 'INFO'
 
     if ($hasNativeLaps) {
-        # Server [2019, 2022, 2025]
         $lapsPolicyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\LAPS'
         if (-not $AuditOnly) {
             Set-RegistryValueSafely -Path $lapsPolicyPath -Name 'PasswordEncryption' -Value 1 -PropertyType DWord
 
-            # Server [2025] Dedicated DSRM Password synchronization
             if ($HostOS.ServerYear -eq '2025' -and $HostOS.IsDC) {
                 Set-RegistryValueSafely -Path $lapsPolicyPath -Name 'BackupDirectory' -Value 1 -PropertyType DWord
                 Write-HardeningLog -Message "Configured Windows Server 2025 Native LAPS directory backup policy." -Level 'SUCCESS'
@@ -542,7 +598,6 @@ try {
         }
     }
     elseif ($hasLegacyLaps) {
-        # Server [2012, 2012R2, 2016]
         Write-HardeningLog -Message "Host is using Legacy LAPS (AdmPwd). Ensure 'ms-Mcs-AdmPwd' schema permissions are restricted." -Level 'WARN'
     }
     else {
@@ -556,8 +611,6 @@ catch {
 
 #region Component 6: Remote Hash Dumping / DCSync Audit (DS-Replication Rights)
 # Server [2012, 2012R2, 2016, 2019, 2022, 2025]
-# Audits the root of Active Directory for non-standard accounts possessing replication rights.
-# Whitelists RID 498 (Enterprise Read-only Domain Controllers) and RID 521 (Read-only Domain Controllers).
 Write-HardeningLog -Message "Executing Component 6: Active Directory DCSync Access Control Audit..." -Level 'INFO'
 
 function Audit-DCSyncReplicationRights {
@@ -570,7 +623,7 @@ function Audit-DCSyncReplicationRights {
             $domainDN = ([ADSI]"LDAP://RootDSE").defaultNamingContext
             $dsaclsPath = Join-Path -Path $env:SystemRoot -ChildPath "System32\dsacls.exe"
 
-            if (Test-Path -Path $dsaclsPath) {
+            if (Test-Path $dsaclsPath) {
                 $rawAcl = & "$dsaclsPath" "$domainDN"
                 $matches = $rawAcl | Select-String -Pattern 'Replicating Directory Changes'
                 foreach ($line in $matches) {
@@ -586,7 +639,6 @@ function Audit-DCSyncReplicationRights {
         $domainDN = (Get-ADDomain).DistinguishedName
         $domainAcl = Get-Acl -Path "AD:\$domainDN"
 
-        # Extended Rights GUIDs for DCSync
         $dcSyncGuids = @{
             '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
             '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
@@ -599,7 +651,6 @@ function Audit-DCSyncReplicationRights {
             'S-1-5-18'       # Local System
         )
 
-        # Baseline Allowed RIDs (includes 498 and 521 to eliminate false positives)
         $allowedRids = @(
             498, # Enterprise Read-only Domain Controllers (Universal Group)
             512, # Domain Admins
@@ -689,3 +740,11 @@ if (-not $AuditOnly -and $script:OriginalStateRecords.Count -gt 0) {
 #endregion
 
 Write-HardeningLog -Message "Domain Controller hardening pass completed successfully." -Level 'SUCCESS'
+
+#region Live Monitor Invocation
+if ($MonitorFirewall) {
+    Start-RedTeamFirewallMonitor
+} else {
+    Write-HardeningLog -Message "To launch the live Red Team firewall monitor, run: .\DCHardening.ps1 -MonitorFirewall -AuditOnly" -Level 'INFO'
+}
+#endregion
