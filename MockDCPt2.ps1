@@ -1,5 +1,5 @@
 # ==============================================================================
-# PHASE 2: POPULATE MOCK USERS AND ORGANIZATIONAL UNITS
+# PHASE 2: POPULATE MOCK USERS AND ORGANIZATIONAL UNITS (FIXED)
 # Run this AFTER the server has rebooted and you have logged into the domain.
 # ==============================================================================
 
@@ -19,7 +19,7 @@ if (-not (Get-ADOrganizationalUnit -Filter "Name -eq '$OUName'")) {
 $MockUsers = @(
     @{First="John";  Last="Doe";      Dept="IT";       Title="System Administrator"}
     @{First="Jane";  Last="Smith";    Dept="HR";       Title="HR Specialist"}
-    @{First="Bob";   Last="Johnson";  Dept="Sales";    Dept="Sales Manager"}
+    @{First="Bob";   Last="Johnson";  Dept="Sales";    Title="Sales Manager"}
     @{First="Alice"; Last="Williams"; Dept="Finance";  Title="Accountant"}
     @{First="Charlie";Last="Brown";   Dept="IT";       Title="Helpdesk Technician"}
 )
@@ -28,7 +28,7 @@ $MockUsers = @(
 $DefaultPassword = ConvertTo-SecureString "MockUserP@ss123" -AsPlainText -Force
 
 foreach ($User in $MockUsers) {
-    $SAMAccountName = ($User.First[0] + $User.Last).ToLower()
+    $SAMAccountName = ($User.First + $User.Last).ToLower()
     $UserPrincipalName = "$SAMAccountName@$((Get-ADDomain).DNSRoot)"
     $DisplayName = "$($User.First) $($User.Last)"
     
@@ -53,4 +53,4 @@ foreach ($User in $MockUsers) {
 }
 
 Write-Host "`nMock Domain Setup Complete!" -ForegroundColor Cyan
-Write-Host "All users have been set with the default password: MockUserP@ss123" -ForegroundColor Western
+Write-Host "All users have been set with the default password: MockUserP@ss123" -ForegroundColor Green
