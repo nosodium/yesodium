@@ -1,10 +1,8 @@
 <#
 .SYNOPSIS
-    CCDC Universal Inventory & Threat Baseline Engine
+    CCDC Universal Inventory & Baseline Engine (v6 - Fast Registry Engine)
 .DESCRIPTION
-    Compatible across Windows Server 2012, 2012 R2, 2016, 2019, 2022, and 2025.
-    Audits TCP network listeners, host configs, accounts, core services,
-    and flags third-party unquoted service backdoors.
+    Zero WMI hangs. Compatible with Windows Server 2012, 2012 R2, 2016, 2019, 2022, 2025.
 #>
 
 [CmdletBinding()]
@@ -38,52 +36,6 @@ function Show-SystemNetworkConfig {
         Write-Output ("Subnet Mask     : {0}" -f ($nic.IPSubnet -join ', '))
         Write-Output ("Default Gateway : {0}" -f ($nic.DefaultIPGateway -join ', '))
         Write-Output ("DNS Servers     : {0}" -f ($nic.DNSServerSearchOrder -join ', '))
-    }
-}
-
-function Show-ActiveTCPListeners {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               ACTIVE TCP LISTENERS ONLY                         " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
-    Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "PROTO", "LOCAL ADDRESS:PORT", "PID", "PROCESS NAME") -ForegroundColor White
-    Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "=====", "==============================", "===", "============") -ForegroundColor Gray
-
-    # Pre-cache process names to prevent slow repeated lookups
-    $procTable = @{}
-    Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[$_.Id] = $_.ProcessName }
-    $procTable[0] = "System Idle"
-    $procTable[4] = "System"
-
-    $tcpFound = 0
-
-    # 1. Primary: NetTCPIP module
-    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
-        $tcpList = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
-        foreach ($conn in $tcpList) {
-            $endpoint = "{0}:{1}" -f $conn.LocalAddress, $conn.LocalPort
-            $pidNum   = [int]$conn.OwningProcess
-            $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-            
-            # Highlight dangerous ports in red (SSH 22, C2 mock 4444, RDP 3389)
-            $color = if ($endpoint -match ":(22|4444|3389)$") { "Red" } else { "White" }
-            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $color
-            $tcpFound++
-        }
-    }
-
-    # 2. Resilient Netstat Fallback (if Get-NetTCPConnection yields 0 results)
-    if ($tcpFound -eq 0) {
-        cmd.exe /c "netstat -ano -p tcp" | Select-String "LISTENING" | ForEach-Object {
-            $line = $_.Line.Trim()
-            if ($line -match "^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)") {
-                $endpoint = $matches[1]
-                $pidNum   = [int]$matches[2]
-                $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-                
-                $color = if ($endpoint -match ":(22|4444|3389)$") { "Red" } else { "White" }
-                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $color
-            }
-        }
     }
 }
 
@@ -138,17 +90,39 @@ function Show-CoreServices {
         "sshd", "wuauserv", "CertSvc"
     )
 
-    $allServices = @{}
-    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
-        $allServices[$_.Name.ToLower()] = $_
+    $startMap = @{
+        0 = "Boot"
+        1 = "System"
+        2 = "Automatic"
+        3 = "Manual"
+        4 = "Disabled"
     }
 
     foreach ($svcName in $coreTargets) {
-        $key = $svcName.ToLower()
-        if ($allServices.ContainsKey($key)) {
-            $s = $allServices[$key]
-            $color = if ($s.Name -eq "sshd" -and $s.State -eq "Running") { "Red" } else { "White" }
-            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $s.Name, $s.State, $s.StartMode, $s.DisplayName) -ForegroundColor $color
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
+        
+        if (Test-Path $regPath) {
+            $regProps = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+            $dispName = if ($regProps.DisplayName) { $regProps.DisplayName } else { $svcName }
+            $startDword = $regProps.Start
+            $startMode = if ($startMap.ContainsKey($startDword)) { $startMap[$startDword] } else { "Unknown($startDword)" }
+
+            $scOutput = cmd.exe /c "sc query $svcName" 2>$null | Select-String "STATE"
+            $state = "STOPPED"
+            if ($scOutput -match "RUNNING") {
+                $state = "RUNNING"
+            } elseif ($scOutput -match "PAUSED") {
+                $state = "PAUSED"
+            }
+
+            $color = "White"
+            if ($svcName -eq "sshd" -and $state -eq "RUNNING") {
+                $color = "Red"
+            } elseif ($state -eq "RUNNING") {
+                $color = "Green"
+            }
+
+            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, $state, $startMode, $dispName) -ForegroundColor $color
         } else {
             Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", "Service not installed on this host") -ForegroundColor DarkGray
         }
@@ -223,28 +197,25 @@ while ($true) {
     Write-Host "`n========================================================" -ForegroundColor Cyan
     Write-Host "             CCDC SYSTEM AUDIT & INVENTORY MENU         " -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
-    Write-Host "[1] Active Network Listeners (TCP Only with PID/Process)" -ForegroundColor Yellow
-    Write-Host "[2] System & Network Configuration (IP, Gateway, DNS, MAC)"
-    Write-Host "[3] Local & Domain Accounts / Privileged Groups"
-    Write-Host "[4] Core Active Directory & Infrastructure Services Status" -ForegroundColor Yellow
-    Write-Host "[5] Third-Party & Non-Default Services (Unquoted Paths)" -ForegroundColor Yellow
-    Write-Host "[6] Installed Applications & Enabled Windows Features"
+    Write-Host "[1] System & Network Configuration (IP, Gateway, DNS, MAC)"
+    Write-Host "[2] Local & Domain Accounts / Privileged Groups"
+    Write-Host "[3] Core Active Directory & Infrastructure Services Status" -ForegroundColor Yellow
+    Write-Host "[4] Third-Party & Non-Default Services (Unquoted Paths)" -ForegroundColor Yellow
+    Write-Host "[5] Installed Applications & Enabled Windows Features"
     Write-Host "[A] Run FULL Inventory (All Modules - for Copy-Pasting)" -ForegroundColor Green
     Write-Host "[Q] Quit" -ForegroundColor Red
     Write-Host "--------------------------------------------------------"
     
-    $choice = Read-Host "Select an option [1-6, A, Q]"
+    $choice = Read-Host "Select an option [1-5, A, Q]"
 
     switch ($choice.ToUpper()) {
-        "1" { Show-ActiveTCPListeners }
-        "2" { Show-SystemNetworkConfig }
-        "3" { Show-UsersAndGroups }
-        "4" { Show-CoreServices }
-        "5" { Show-ThirdPartyServices }
-        "6" { Show-InstalledAppsAndFeatures }
+        "1" { Show-SystemNetworkConfig }
+        "2" { Show-UsersAndGroups }
+        "3" { Show-CoreServices }
+        "4" { Show-ThirdPartyServices }
+        "5" { Show-InstalledAppsAndFeatures }
         "A" {
             Show-SystemNetworkConfig
-            Show-ActiveTCPListeners
             Show-UsersAndGroups
             Show-CoreServices
             Show-ThirdPartyServices
@@ -258,7 +229,7 @@ while ($true) {
             return
         }
         Default {
-            Write-Host "`n[!] Invalid selection. Please enter 1-6, A, or Q." -ForegroundColor Red
+            Write-Host "`n[!] Invalid selection. Please enter 1-5, A, or Q." -ForegroundColor Red
         }
     }
 }
