@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    CCDC Universal Inventory & Baseline Engine (v9 - Bug Fix)
+    CCDC Universal Inventory & Baseline Engine (v10 - Plain Text / No Color Conflicts)
 .DESCRIPTION
-    Zero PS5+ syntax dependencies. Compatible with Windows Server 2012 through 2025.
+    Zero PS5+ dependencies. 100% compatible across Windows Server 2012 to 2025.
 #>
 
 # ====================================================================
@@ -10,14 +10,14 @@
 # ====================================================================
 
 function Show-SystemNetworkConfig {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               SYSTEM & NETWORK INTERFACE BASELINE               " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Output "`n================================================================="
+    Write-Output "               SYSTEM & NETWORK INTERFACE BASELINE               "
+    Write-Output "================================================================="
     
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
     
-    Write-Host "`n[+] HOST CONFIGURATION" -ForegroundColor Yellow
+    Write-Output "`n[+] HOST CONFIGURATION"
     Write-Output ("Hostname        : {0}" -f $env:COMPUTERNAME)
     Write-Output ("Domain / Workgr : {0}" -f $cs.Domain)
     Write-Output ("OS Caption      : {0}" -f $os.Caption)
@@ -25,7 +25,7 @@ function Show-SystemNetworkConfig {
     Write-Output ("Architecture    : {0}" -f $os.OSArchitecture)
     Write-Output ("Last Boot Time  : {0}" -f $os.LastBootUpTime)
 
-    Write-Host "`n[+] NETWORK INTERFACES" -ForegroundColor Yellow
+    Write-Output "`n[+] NETWORK INTERFACES"
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) {
         Write-Output "---------------------------------------------------------"
@@ -39,21 +39,21 @@ function Show-SystemNetworkConfig {
 }
 
 function Show-UsersAndGroups {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               USERS AND PRIVILEGED GROUPS                       " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Output "`n================================================================="
+    Write-Output "               USERS AND PRIVILEGED GROUPS                       "
+    Write-Output "================================================================="
 
-    Write-Host "`n[+] LOCAL ACCOUNTS (MEMBER SERVERS / STANDALONE)" -ForegroundColor Yellow
+    Write-Output "`n[+] LOCAL ACCOUNTS (MEMBER SERVERS / STANDALONE)"
     $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue
     if ($localUsers) {
         foreach ($user in $localUsers) {
             Write-Output ("Account: {0,-25} | Disabled: {1,-5} | PasswordChangeable: {2}" -f $user.Name, $user.Disabled, $user.PasswordChangeable)
         }
     } else {
-        Write-Host "No local SAM accounts found (Standard behavior for Domain Controllers)." -ForegroundColor DarkGray
+        Write-Output "No local SAM accounts found (Standard behavior for Domain Controllers)."
     }
 
-    Write-Host "`n[+] LOCAL / BUILTIN ADMINISTRATORS" -ForegroundColor Yellow
+    Write-Output "`n[+] LOCAL / BUILTIN ADMINISTRATORS"
     try {
         $adminGroup = Get-CimInstance Win32_Group -Filter "LocalAccount=True AND SID='S-1-5-32-544'" -ErrorAction Stop
         $admins = Get-CimInstance -Query "ASSOCIATORS OF {Win32_Group.Domain='$($env:COMPUTERNAME)',Name='$($adminGroup.Name)'} WHERE ResultClass=Win32_UserAccount"
@@ -64,7 +64,7 @@ function Show-UsersAndGroups {
     }
 
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
-        Write-Host "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS" -ForegroundColor Yellow
+        Write-Output "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS"
         try {
             $da = Get-ADGroupMember -Identity "Domain Admins" -Recursive -ErrorAction Stop | Select-Object -ExpandProperty SamAccountName
             Write-Output ("Domain Admins     : {0}" -f ($da -join ', '))
@@ -81,7 +81,7 @@ function Show-UsersAndGroups {
             Write-Output ("Enterprise Admins : {0}" -f ($netEA -join ', '))
         }
 
-        Write-Host "`n[+] ALL DOMAIN USERS (RECURSIVE SEARCH ACROSS ALL OUs)" -ForegroundColor Yellow
+        Write-Output "`n[+] ALL DOMAIN USERS (RECURSIVE SEARCH ACROSS ALL OUs)"
         $userObjects = @()
 
         # Method 1: ActiveDirectory module
@@ -130,26 +130,24 @@ function Show-UsersAndGroups {
             $namesOnly = ($userObjects | Select-Object -ExpandProperty SamAccountName) -join ', '
             Write-Output ("Accounts List: " + $namesOnly)
 
-            # Fixed: Properly wrapped in parentheses so -f does not bind to -ForegroundColor
-            Write-Host ("`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH") -ForegroundColor White
-            Write-Host ("{0,-25} {1,-8} {2}" -f "============", "=======", "===========================") -ForegroundColor Gray
+            Write-Output ("`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH")
+            Write-Output ("{0,-25} {1,-8} {2}" -f "============", "=======", "===========================")
             
             foreach ($u in ($userObjects | Sort-Object OU, SamAccountName)) {
-                $color = if ($u.Enabled) { "White" } else { "DarkGray" }
-                Write-Host ("{0,-25} {1,-8} {2}" -f $u.SamAccountName, $u.Enabled, $u.OU) -ForegroundColor $color
+                Write-Output ("{0,-25} {1,-8} {2}" -f $u.SamAccountName, $u.Enabled, $u.OU)
             }
         } else {
-            Write-Host "Could not query Active Directory user accounts." -ForegroundColor Red
+            Write-Output "Could not query Active Directory user accounts."
         }
     }
 }
 
 function Show-CoreServices {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               CORE AD & INFRASTRUCTURE SERVICES                " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
-    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATE", "START MODE", "FRIENDLY NAME") -ForegroundColor White
-    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "=====", "==========", "=============") -ForegroundColor Gray
+    Write-Output "`n================================================================="
+    Write-Output "               CORE AD & INFRASTRUCTURE SERVICES                "
+    Write-Output "================================================================="
+    Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATE", "START MODE", "FRIENDLY NAME")
+    Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "=====", "==========", "=============")
 
     $coreTargets = @{
         "NTDS"               = "Active Directory Domain Services"
@@ -191,27 +189,25 @@ function Show-CoreServices {
                 $state = "PAUSED"
             }
 
-            $color = "White"
+            $alert = ""
             if ($svcName -eq "sshd" -and $state -eq "RUNNING") {
-                $color = "Red"
-            } elseif ($state -eq "RUNNING") {
-                $color = "Green"
+                $alert = " [!] BACKDOOR RISK"
             }
 
-            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, $state, $startMode, $friendlyName) -ForegroundColor $color
+            Write-Output ("{0,-20} {1,-12} {2,-12} {3}{4}" -f $svcName, $state, $startMode, $friendlyName, $alert)
         } else {
-            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", $coreTargets[$svcName]) -ForegroundColor DarkGray
+            Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", $coreTargets[$svcName])
         }
     }
 }
 
 function Show-ThirdPartyServices {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "          THIRD-PARTY / NON-DEFAULT INSTALLED SERVICES           " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
-    Write-Host "Identifies non-standard services, Red Team backdoors, and unquoted paths." -ForegroundColor Gray
-    Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "SERVICE NAME", "STATE", "STARTMODE", "PATHNAME") -ForegroundColor White
-    Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "============", "=====", "=========", "========") -ForegroundColor Gray
+    Write-Output "`n================================================================="
+    Write-Output "          THIRD-PARTY / NON-DEFAULT INSTALLED SERVICES           "
+    Write-Output "================================================================="
+    Write-Output "Identifies non-standard services, Red Team backdoors, and unquoted paths."
+    Write-Output ("{0,-22} {1,-10} {2,-10} {3}" -f "SERVICE NAME", "STATE", "STARTMODE", "PATHNAME")
+    Write-Output ("{0,-22} {1,-10} {2,-10} {3}" -f "============", "=====", "=========", "========")
 
     $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
     $foundNonDefault = 0
@@ -226,28 +222,23 @@ function Show-ThirdPartyServices {
             $foundNonDefault++
 
             $isUnquoted = ($path -notmatch '^"') -and ($path -match '\.exe(\s|$)') -and ($path -match ' ')
-
-            $color = "Yellow"
-            if ($s.Name -match "sshd|backdoor|nc|ncat|meterpreter" -or $isUnquoted) {
-                $color = "Red"
-            }
-
             $unquotedTag = if ($isUnquoted) { " [!] UNQUOTED PATH VULN" } else { "" }
-            Write-Host ("{0,-22} {1,-10} {2,-10} {3}{4}" -f $s.Name, $s.State, $s.StartMode, $path, $unquotedTag) -ForegroundColor $color
+            
+            Write-Output ("{0,-22} {1,-10} {2,-10} {3}{4}" -f $s.Name, $s.State, $s.StartMode, $path, $unquotedTag)
         }
     }
 
     if ($foundNonDefault -eq 0) {
-        Write-Host "No non-default third-party services detected." -ForegroundColor Green
+        Write-Output "No non-default third-party services detected."
     }
 }
 
 function Show-InstalledAppsAndFeatures {
-    Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               INSTALLED APPLICATIONS & FEATURES                 " -ForegroundColor Cyan
-    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Output "`n================================================================="
+    Write-Output "               INSTALLED APPLICATIONS & FEATURES                 "
+    Write-Output "================================================================="
 
-    Write-Host "`n[+] INSTALLED WINDOWS FEATURES (ACTIVE)" -ForegroundColor Yellow
+    Write-Output "`n[+] INSTALLED WINDOWS FEATURES (ACTIVE)"
     if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
         Get-WindowsFeature | Where-Object { $_.Installed -eq $true } | ForEach-Object {
             Write-Output ("Feature: {0,-32} | {1}" -f $_.Name, $_.DisplayName)
@@ -256,7 +247,7 @@ function Show-InstalledAppsAndFeatures {
         Write-Output "Get-WindowsFeature cmdlet not supported on this operating system."
     }
 
-    Write-Host "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)" -ForegroundColor Yellow
+    Write-Output "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)"
     $regPaths = @(
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
@@ -267,7 +258,7 @@ function Show-InstalledAppsAndFeatures {
             Write-Output ("App: {0,-40} | Version: {1,-15} | Publisher: {2}" -f $app.DisplayName, $app.DisplayVersion, $app.Publisher)
         }
     } else {
-        Write-Host "No third-party MSI/registered application packages found." -ForegroundColor DarkGray
+        Write-Output "No third-party MSI/registered application packages found."
     }
 }
 
@@ -276,17 +267,17 @@ function Show-InstalledAppsAndFeatures {
 # ====================================================================
 
 while ($true) {
-    Write-Host "`n========================================================" -ForegroundColor Cyan
-    Write-Host "             CCDC SYSTEM AUDIT & INVENTORY MENU         " -ForegroundColor Cyan
-    Write-Host "========================================================" -ForegroundColor Cyan
-    Write-Host "[1] System & Network Configuration (IP, Gateway, DNS, MAC)"
-    Write-Host "[2] Local & Domain Accounts / Privileged Groups / ADUC Users" -ForegroundColor Yellow
-    Write-Host "[3] Core Active Directory & Infrastructure Services Status" -ForegroundColor Yellow
-    Write-Host "[4] Third-Party & Non-Default Services (Unquoted Paths)" -ForegroundColor Yellow
-    Write-Host "[5] Installed Applications & Enabled Windows Features"
-    Write-Host "[A] Run FULL Inventory (All Modules - for Copy-Pasting)" -ForegroundColor Green
-    Write-Host "[Q] Quit" -ForegroundColor Red
-    Write-Host "--------------------------------------------------------"
+    Write-Output "`n========================================================"
+    Write-Output "             CCDC SYSTEM AUDIT & INVENTORY MENU         "
+    Write-Output "========================================================"
+    Write-Output "[1] System & Network Configuration (IP, Gateway, DNS, MAC)"
+    Write-Output "[2] Local & Domain Accounts / Privileged Groups / ADUC Users"
+    Write-Output "[3] Core Active Directory & Infrastructure Services Status"
+    Write-Output "[4] Third-Party & Non-Default Services (Unquoted Paths)"
+    Write-Output "[5] Installed Applications & Enabled Windows Features"
+    Write-Output "[A] Run FULL Inventory (All Modules - for Copy-Pasting)"
+    Write-Output "[Q] Quit"
+    Write-Output "--------------------------------------------------------"
     
     $choice = Read-Host "Select an option [1-5, A, Q]"
 
@@ -302,16 +293,16 @@ while ($true) {
             Show-CoreServices
             Show-ThirdPartyServices
             Show-InstalledAppsAndFeatures
-            Write-Host "`n=================================================================" -ForegroundColor Green
-            Write-Host "                   FULL BASELINE COMPLETED                       " -ForegroundColor Green
-            Write-Host "=================================================================" -ForegroundColor Green
+            Write-Output "`n================================================================="
+            Write-Output "                   FULL BASELINE COMPLETED                       "
+            Write-Output "================================================================="
         }
         "Q" {
-            Write-Host "`nExiting CCDC Inventory Tool." -ForegroundColor Gray
+            Write-Output "`nExiting CCDC Inventory Tool."
             return
         }
         Default {
-            Write-Host "`n[!] Invalid selection. Please enter 1-5, A, or Q." -ForegroundColor Red
+            Write-Output "`n[!] Invalid selection. Please enter 1-5, A, or Q."
         }
     }
 }
