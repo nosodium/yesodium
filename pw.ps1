@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-    Interactive Controlled Credential Rotation (Server 2012-2025 Compatible)
+    Interactive Controlled Credential Rotation (All Domain Users)
 .DESCRIPTION
-    Zero pipeline delays, pure ASCII, no coloring parameters.
+    Iterates through all Local Accounts and ALL Active Directory Domain Users.
+    Compatible across Windows Server 2012 to 2025. Pure ASCII.
 #>
 
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
@@ -13,23 +14,22 @@ function Set-UserCredentialPrompt {
         [string]$Type
     )
 
-    # Embed username and account type directly into the prompt to prevent buffer desync
-    $promptMsg = "`nChange password for [" + $Type + "] '" + $Username + "'? ([Y]es / [S]kip / [Q]uit)"
-    $choice = Read-Host $promptMsg
+    # Prompt explicitly displays account type and target username
+    $choice = Read-Host "`nChange password for [$Type User: $Username]? ([Y]es / [S]kip / [Q]uit)"
     
     if ($choice -eq 'Q' -or $choice -eq 'q') { return $false }
     if ($choice -ne 'Y' -and $choice -ne 'y') { 
-        [Console]::WriteLine("Skipped " + $Username + ".")
+        [Console]::WriteLine("[-] Skipped $Username.")
         return $true 
     }
 
-    $passSecure = Read-Host "Enter new password for '$Username' (masked)" -AsSecureString
+    $passSecure = Read-Host "Enter new password for $Username (masked)" -AsSecureString
     
     # PS 4.0 / Server 2012 R2 compatible credential conversion
     $passPlain = (New-Object System.Net.NetworkCredential('', $passSecure)).Password
 
     if ([string]::IsNullOrWhiteSpace($passPlain)) {
-        [Console]::WriteLine("Password cannot be empty. Skipping.")
+        [Console]::WriteLine("[-] Password cannot be empty. Skipped $Username.")
         return $true
     }
 
@@ -38,38 +38,76 @@ function Set-UserCredentialPrompt {
             $user = [ADSI]"WinNT://$env:COMPUTERNAME/$Username,user"
             $user.SetPassword($passPlain)
             $user.SetInfo()
-            [Console]::WriteLine("[+] Local account " + $Username + " password successfully updated.")
+            [Console]::WriteLine("[+] Local account '$Username' password updated successfully.")
         } elseif ($Type -eq "Domain") {
             Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset $true
-            Set-ADUser -Identity $Username -PasswordNeverExpires $true -CannotChangePassword $true
-            [Console]::WriteLine("[+] Domain account " + $Username + " password successfully updated.")
+            Set-ADUser -Identity $Username -PasswordNeverExpires $true
+            [Console]::WriteLine("[+] Domain user '$Username' password updated successfully.")
         }
     } catch {
-        [Console]::WriteLine("[-] Failed to set password for " + $Username + " - " + $_.Exception.Message)
+        [Console]::WriteLine("[-] Error setting password for $Username - " + $_.Exception.Message)
     }
     return $true
 }
 
-[Console]::WriteLine("=== CCDC INTERACTIVE CREDENTIAL ROTATION ===")
+[Console]::WriteLine("=================================================================")
+[Console]::WriteLine("             CCDC INTERACTIVE CREDENTIAL ROTATION                ")
+[Console]::WriteLine("=================================================================")
 
-# 1. Local Accounts (Member servers and standalone hosts)
+# 1. Local Accounts (Applies to Member Servers & Standalone hosts)
 $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 if ($localUsers) {
+    [Console]::WriteLine("[*] Checking Local Accounts...")
     foreach ($lUser in $localUsers) {
         $continue = Set-UserCredentialPrompt -Username $lUser -Type "Local"
         if (-not $continue) { break }
     }
 }
 
-# 2. Domain Admins (Domain Controllers)
-if (Get-Command Get-ADGroupMember -ErrorAction SilentlyContinue) {
-    $domainAdmins = Get-ADGroupMember -Identity "Domain Admins" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SamAccountName
-    if ($domainAdmins) {
-        foreach ($dAdmin in $domainAdmins) {
-            $continue = Set-UserCredentialPrompt -Username $dAdmin -Type "Domain"
-            if (-not $continue) { break }
+# 2. ALL Active Directory Domain Users (Recursive across all OUs)
+if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+    [Console]::WriteLine("[*] Enumerating All Domain Users from Active Directory...")
+    $allDomainUsers = @()
+
+    # Method A: Active Directory Module
+    if (Get-Command Get-ADUser -ErrorAction SilentlyContinue) {
+        $allDomainUsers = Get-ADUser -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SamAccountName
+    }
+
+    # Method B: ADSI LDAP Fallback (Server 2012 / PS 4.0 compatible)
+    if (-not $allDomainUsers -or $allDomainUsers.Count -eq 0) {
+        try {
+            $rootDSE = [ADSI]"LDAP://RootDSE"
+            $defaultNamingContext = $rootDSE.defaultNamingContext
+            $ldapRoot = [ADSI]"LDAP://$defaultNamingContext"
+            $searcher = New-Object System.DirectoryServices.DirectorySearcher($ldapRoot)
+            $searcher.Filter = "(&(objectCategory=person)(objectClass=user))"
+            $searcher.PageSize = 1000
+            $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+            
+            $results = $searcher.FindAll()
+            foreach ($r in $results) {
+                $allDomainUsers += [string]$r.Properties["samaccountname"]
+            }
+        } catch {}
+    }
+
+    # Prompt through all discovered domain users
+    if ($allDomainUsers.Count -gt 0) {
+        [Console]::WriteLine("[+] Discovered " + $allDomainUsers.Count + " total domain users.")
+        foreach ($dUser in ($allDomainUsers | Sort-Object)) {
+            # Skip computer accounts (ending in $)
+            if ($dUser.EndsWith("$")) { continue }
+
+            $continue = Set-UserCredentialPrompt -Username $dUser -Type "Domain"
+            if (-not $continue) { 
+                [Console]::WriteLine("[!] Rotation aborted by user.")
+                break 
+            }
         }
+    } else {
+        [Console]::WriteLine("[-] No domain users found or unable to contact domain controller.")
     }
 }
 
-[Console]::WriteLine("`n[+] Credential rotation pass complete.")
+[Console]::WriteLine("`n[+] Credential rotation sequence complete.")
