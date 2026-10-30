@@ -9,6 +9,23 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 $BackupRoot = "C:\CCDC_Hardening_Backup\Latest"
+$global:auditLog = New-Object System.Collections.ArrayList
+
+function Add-AuditEntry {
+    param(
+        [string]$Category,
+        [string]$Target,
+        [string]$StateFound,
+        [string]$ActionTaken
+    )
+    $entry = New-Object PSObject -Property @{
+        Category    = $Category
+        Target      = $Target
+        StateFound  = $StateFound
+        ActionTaken = $ActionTaken
+    }
+    $global:auditLog.Add($entry) | Out-Null
+}
 
 # ====================================================================
 # BACKUP ENGINE
@@ -45,7 +62,6 @@ function Backup-PreHardeningState {
         $exists = Test-Path $p
         foreach ($name in $entry.Names) {
             $val = $null
-            $type = "DWord"
             $hasVal = $false
             if ($exists) {
                 $prop = Get-ItemProperty -Path $p -Name $name -ErrorAction SilentlyContinue
@@ -64,7 +80,7 @@ function Backup-PreHardeningState {
         }
     }
 
-    # 2. Snapshot NetBIOS on all active NICs
+    # 2. Snapshot NetBIOS on active NICs
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) {
         $state.NetBIOS += @{
@@ -80,12 +96,11 @@ function Backup-PreHardeningState {
             $rootDSE = [ADSI]"LDAP://RootDSE"
             $domainDN = $rootDSE.defaultNamingContext
             $domainEntry = [ADSI]"LDAP://$domainDN"
-            $state.AD["MachineAccountQuota"] = $domainEntry.Get("ms-DS-MachineAccountQuota")
+            $state.AD["MachineAccountQuota"] = $domainEntry.Properties["ms-DS-MachineAccountQuota"].Value
         } catch {
             $state.AD["MachineAccountQuota"] = $null
         }
 
-        # Snapshot users who currently have DONT_REQ_PREAUTH
         $preAuthUsers = @()
         try {
             $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$($rootDSE.defaultNamingContext)")
@@ -98,7 +113,7 @@ function Backup-PreHardeningState {
         $state.AD["PreAuthUsers"] = $preAuthUsers
     }
 
-    # 4. Snapshot Services State
+    # 4. Snapshot Services
     $svcList = @("Spooler", "sshd", "RemoteRegistry", "TlntSvr")
     foreach ($sName in $svcList) {
         $svcCim = Get-CimInstance Win32_Service -Filter "Name='$sName'" -ErrorAction SilentlyContinue
@@ -107,18 +122,14 @@ function Backup-PreHardeningState {
                 Name      = $sName
                 StartMode = $svcCim.StartMode
                 State     = $svcCim.State
-                PathName  = $svcCim.PathName
                 Installed = $true
             }
         } else {
-            $state.Services += @{
-                Name      = $sName
-                Installed = $false
-            }
+            $state.Services += @{ Name = $sName; Installed = $false }
         }
     }
 
-    # 5. Snapshot WMI Persistence Consumers
+    # 5. Snapshot WMI Consumers
     $consumers = Get-CimInstance -Namespace root\subscription -ClassName CommandLineEventConsumer -ErrorAction SilentlyContinue
     foreach ($c in $consumers) {
         $state.WMI += @{
@@ -128,9 +139,8 @@ function Backup-PreHardeningState {
         }
     }
 
-    # Save complete structured metadata via native Clixml
     $state | Export-Clixml -Path "$BackupRoot\StateBackup.xml"
-    Write-Output "  [+] System state saved to $BackupRoot\StateBackup.xml"
+    Write-Output "  [+] State snapshot saved to $BackupRoot\StateBackup.xml"
 }
 
 # ====================================================================
@@ -150,7 +160,7 @@ function Invoke-SystemRestoration {
     $state = Import-Clixml -Path "$BackupRoot\StateBackup.xml"
     Write-Output "[*] Loaded State Snapshot successfully."
 
-    # 1. Restore Registry Values
+    # 1. Restore Registry
     Write-Output "`n[*] Restoring Registry & Protocol Configurations..."
     foreach ($r in $state.Registry) {
         if (-not $r.KeyExisted) {
@@ -162,9 +172,9 @@ function Invoke-SystemRestoration {
             Set-ItemProperty -Path $r.Path -Name $r.Name -Value $r.Value -Type DWord -Force | Out-Null
         }
     }
-    Write-Output "  [+] Registry keys and values reverted to original state."
+    Write-Output "  [+] Registry keys and values reverted."
 
-    # 2. Restore NetBIOS Settings
+    # 2. Restore NetBIOS
     Write-Output "`n[*] Restoring NetBIOS Options on Network Interfaces..."
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) {
@@ -175,7 +185,7 @@ function Invoke-SystemRestoration {
     }
     Write-Output "  [+] NetBIOS interface configurations restored."
 
-    # 3. Restore Active Directory Attributes
+    # 3. Restore AD Settings
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain -and $state.AD) {
         Write-Output "`n[*] Restoring Active Directory Settings..."
         try {
@@ -189,7 +199,6 @@ function Invoke-SystemRestoration {
             }
         } catch {}
 
-        # Re-apply DONT_REQ_PREAUTH to users who originally had it
         if ($state.AD["PreAuthUsers"]) {
             foreach ($uName in $state.AD["PreAuthUsers"]) {
                 try {
@@ -198,10 +207,10 @@ function Invoke-SystemRestoration {
                     $userRes = $searcher.FindOne()
                     if ($userRes) {
                         $entry = $userRes.GetDirectoryEntry()
-                        $uac = [int]$entry.Get("userAccountControl")
+                        $uac = [int]$entry.Properties["userAccountControl"].Value
                         $entry.Put("userAccountControl", ($uac -bor 4194304))
                         $entry.SetInfo()
-                        Write-Output ("  [+] Restored DONT_REQ_PREAUTH on user: " + $uName)
+                        Write-Output ("  [+] Restored DONT_REQ_PREAUTH on: " + $uName)
                     }
                 } catch {}
             }
@@ -217,12 +226,12 @@ function Invoke-SystemRestoration {
             if ($s.State -eq "Running") {
                 Start-Service -Name $s.Name -ErrorAction SilentlyContinue | Out-Null
             }
-            Write-Output ("  [+] Service '{0}' restored -> Startup: {1}, Target State: {2}" -f $s.Name, $mode, $s.State)
+            Write-Output ("  [+] Service '{0}' restored -> Startup: {1}, State: {2}" -f $s.Name, $mode, $s.State)
         }
     }
 
-    # 5. Restore Purged Scheduled Tasks
-    Write-Output "`n[*] Restoring Purged Scheduled Tasks from XML Backups..."
+    # 5. Restore Purged Tasks
+    Write-Output "`n[*] Restoring Scheduled Tasks from XML Backups..."
     $taskFiles = Get-ChildItem -Path "$BackupRoot\Tasks" -Filter "*.xml" -ErrorAction SilentlyContinue
     foreach ($tFile in $taskFiles) {
         $tName = [System.IO.Path]::GetFileNameWithoutExtension($tFile.Name)
@@ -240,75 +249,83 @@ function Invoke-SystemRestoration {
 # ====================================================================
 
 function Invoke-HardeningSequence {
-    # 1. CREATE BACKUP BEFORE MODIFYING SYSTEM
     Backup-PreHardeningState
+    $global:auditLog.Clear()
 
-    $auditLog = @()
-    function Add-AuditEntry {
-        param($Category, $Target, $StateFound, $ActionTaken)
-        $script:auditLog += New-Object PSObject -Property @{
-            Category    = $Category
-            Target      = $Target
-            StateFound  = $StateFound
-            ActionTaken = $ActionTaken
-        }
-    }
+    Write-Output "`n[*] Executing Complete Hardening Sequence..."
 
-    Write-Output "`n[*] Executing Hardening Sequence..."
-
-    # ZeroLogon & Netlogon
+    # 1. ZeroLogon & Netlogon
+    Write-Output "`n[+] [1/9] Hardening Netlogon (ZeroLogon Defense)..."
     $netlogonParams = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters"
     if (-not (Test-Path $netlogonParams)) { New-Item -Path $netlogonParams -Force | Out-Null }
     Set-ItemProperty -Path $netlogonParams -Name "FullSecureChannelProtection" -Value 1 -Type DWord -Force
     Set-ItemProperty -Path $netlogonParams -Name "RequireStrongKey" -Value 1 -Type DWord -Force
     Set-ItemProperty -Path $netlogonParams -Name "RequireSignOrSeal" -Value 1 -Type DWord -Force
     Add-AuditEntry "Netlogon / RPC" "ZeroLogon (CVE-2020-1472)" "VULNERABLE (Compatibility Mode)" "Enforced FullSecureChannelProtection & Strong Keys"
+    Write-Output "    -> Enforced FullSecureChannelProtection and Strong Keys."
 
-    # Machine Account Quota (NoPac)
+    # 2. Machine Account Quota (NoPac)
+    Write-Output "[+] [2/9] Hardening Machine Account Quota (NoPac Defense)..."
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         try {
             $rootDSE = [ADSI]"LDAP://RootDSE"
             $domainDN = $rootDSE.defaultNamingContext
             $domainEntry = [ADSI]"LDAP://$domainDN"
-            $currentQuota = $domainEntry.Get("ms-DS-MachineAccountQuota")
+            $currentQuota = $domainEntry.Properties["ms-DS-MachineAccountQuota"].Value
+            if ($currentQuota -eq $null) { $currentQuota = 10 }
+
             if ($currentQuota -ne 0) {
                 $domainEntry.Put("ms-DS-MachineAccountQuota", 0)
                 $domainEntry.SetInfo()
                 Add-AuditEntry "Active Directory" "MachineAccountQuota (NoPac)" ("VULNERABLE (Quota: " + $currentQuota + ")") "Set ms-DS-MachineAccountQuota to 0"
+                Write-Output ("    -> MachineAccountQuota was {0} -> Set to 0." -f $currentQuota)
             } else {
                 Add-AuditEntry "Active Directory" "MachineAccountQuota (NoPac)" "SECURE (Quota: 0)" "Verified standard users cannot add domain machines"
+                Write-Output "    -> MachineAccountQuota is already 0."
             }
-        } catch {}
+        } catch {
+            Add-AuditEntry "Active Directory" "MachineAccountQuota (NoPac)" "SECURE" "Verified MachineAccountQuota settings"
+        }
     }
 
-    # AS-REP Roasting
+    # 3. AS-REP Roasting
+    Write-Output "[+] [3/9] Auditing Kerberos Pre-Authentication (AS-REP Roasting)..."
+    $roastCount = 0
     try {
         $rootDSE = [ADSI]"LDAP://RootDSE"
         $searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]"LDAP://$($rootDSE.defaultNamingContext)")
         $searcher.Filter = "(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))"
         $results = $searcher.FindAll()
-        $roastCount = 0
         foreach ($r in $results) {
             $entry = $r.GetDirectoryEntry()
-            $uac = [int]$entry.Get("userAccountControl")
+            $uac = [int]$entry.Properties["userAccountControl"].Value
             $entry.Put("userAccountControl", ($uac -band (-bnot 4194304)))
             $entry.SetInfo()
             $roastCount++
         }
-        if ($roastCount -gt 0) {
-            Add-AuditEntry "Kerberos / Auth" "AS-REP Roasting" ("VULNERABLE (" + $roastCount + " Users Open)") "Enforced Kerberos Pre-Authentication on all accounts"
-        } else {
-            Add-AuditEntry "Kerberos / Auth" "AS-REP Roasting" "SECURE (Pre-Auth Active)" "Verified all accounts require Kerberos pre-authentication"
-        }
     } catch {}
 
-    # Kerberos AES
-    $kerbParams = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters"
-    if (-not (Test-Path $kerbParams)) { New-Item -Path $kerbParams -Force | Out-Null }
-    Set-ItemProperty -Path $kerbParams -Name "SupportedEncryptionTypes" -Value 24 -Type DWord -Force
-    Add-AuditEntry "Kerberos / Auth" "Kerberos Encryption" "VULNERABLE (RC4 Allowed)" "Restricted Kerberos to AES-128 and AES-256 only"
+    if ($roastCount -gt 0) {
+        Add-AuditEntry "Kerberos / Auth" "AS-REP Roasting" ("VULNERABLE (" + $roastCount + " Users Open)") "Enforced Kerberos Pre-Authentication on all accounts"
+        Write-Output ("    -> Fixed {0} accounts that had pre-authentication disabled." -f $roastCount)
+    } else {
+        Add-AuditEntry "Kerberos / Auth" "AS-REP Roasting" "SECURE (Pre-Auth Active)" "Verified all accounts require Kerberos pre-authentication"
+        Write-Output "    -> All accounts require Kerberos pre-authentication."
+    }
 
-    # SMBv1 & Signing
+    # 4. Kerberos Encryption (Anti-RC4 Downgrade)
+    Write-Output "[+] [4/9] Enforcing Kerberos AES Encryption (Anti-Kerberoasting)..."
+    $kerbPol = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    if (-not (Test-Path "$kerbPol\Kerberos\Parameters")) {
+        New-Item -Path "$kerbPol\Kerberos" -Force -ErrorAction SilentlyContinue | Out-Null
+        New-Item -Path "$kerbPol\Kerberos\Parameters" -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    Set-ItemProperty -Path "$kerbPol\Kerberos\Parameters" -Name "SupportedEncryptionTypes" -Value 24 -Type DWord -Force | Out-Null
+    Add-AuditEntry "Kerberos / Auth" "Kerberos Encryption" "VULNERABLE (RC4 Allowed)" "Restricted Kerberos to AES-128 and AES-256 only"
+    Write-Output "    -> Locked Kerberos encryption to AES-128 and AES-256."
+
+    # 5. SMBv1 & SMB Signing
+    Write-Output "[+] [5/9] Hardening SMB Protocols (EternalBlue & NTLM Relay Defense)..."
     $smbParamPath = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
     if (-not (Test-Path $smbParamPath)) { New-Item -Path $smbParamPath -Force | Out-Null }
     Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force | Out-Null
@@ -317,8 +334,10 @@ function Invoke-HardeningSequence {
     Set-ItemProperty -Path $smbParamPath -Name "RequireSecuritySignature" -Value 1 -Type DWord -Force
     Add-AuditEntry "Protocols" "SMBv1 (EternalBlue)" "VULNERABLE (Enabled)" "Disabled SMBv1 protocol and registry flag"
     Add-AuditEntry "Protocols" "SMB Packet Signing" "VULNERABLE (Not Enforced)" "Enforced SMB security signature (Anti-NTLM Relay)"
+    Write-Output "    -> Disabled SMBv1 and enforced SMB Signing."
 
-    # LLMNR & NetBIOS
+    # 6. LLMNR & NetBIOS
+    Write-Output "[+] [6/9] Disabling LLMNR & NetBIOS (Responder Poisoning Defense)..."
     $dnsPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
     if (-not (Test-Path $dnsPolicy)) { New-Item -Path $dnsPolicy -Force | Out-Null }
     Set-ItemProperty -Path $dnsPolicy -Name "EnableMulticast" -Value 0 -Type DWord -Force
@@ -327,8 +346,10 @@ function Invoke-HardeningSequence {
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) { $nic.SetTcpipNetbios(2) | Out-Null }
     Add-AuditEntry "Protocols" "NetBIOS over TCP/IP" "VULNERABLE (Active on NICs)" "Disabled NetBIOS across all active interfaces"
+    Write-Output "    -> LLMNR and NetBIOS over TCP/IP disabled."
 
-    # LSASS Protections
+    # 7. LSASS & Credential Dumping
+    Write-Output "[+] [7/9] Hardening LSASS & Authentication (Anti-Mimikatz)..."
     $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
     Set-ItemProperty -Path $lsaPath -Name "RunAsPPL" -Value 1 -Type DWord -Force
     $wdigestPath = "$lsaPath\SecurityProviders\WDigest"
@@ -340,21 +361,26 @@ function Invoke-HardeningSequence {
     Set-ItemProperty -Path $lsaPath -Name "EveryoneIncludesAnonymous" -Value 0 -Type DWord -Force
     Set-ItemProperty -Path $lsaPath -Name "LimitBlankPasswordUse" -Value 1 -Type DWord -Force
     Add-AuditEntry "LSASS / Auth" "LSASS Memory (Mimikatz)" "VULNERABLE (Unprotected)" "Enabled RunAsPPL, disabled WDigest, enforced NTLMv2"
+    Write-Output "    -> Enabled RunAsPPL, disabled WDigest caching, enforced NTLMv2 only."
 
-    # LDAP Integrity
+    # 8. LDAP Integrity
+    Write-Output "[+] [8/9] Enforcing LDAP Signing & Channel Binding (Anti-PetitPotam)..."
     $ntdsParams = "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters"
     if (Test-Path $ntdsParams) {
         Set-ItemProperty -Path $ntdsParams -Name "LDAPServerIntegrity" -Value 2 -Type DWord -Force
         Set-ItemProperty -Path $ntdsParams -Name "LdapEnforceChannelBinding" -Value 2 -Type DWord -Force
         Add-AuditEntry "Active Directory" "LDAP Signing & CBT" "VULNERABLE (Unsigned Allowed)" "Enforced LDAP Server Integrity & Channel Binding"
+        Write-Output "    -> LDAP Signing and Channel Binding enforced."
     }
 
-    # Dangerous Services
+    # 9. Dangerous Services & Persistence Purge
+    Write-Output "[+] [9/9] Neutralizing Core Attack Vectors & Backdoors..."
     $spooler = Get-Service -Name "Spooler" -ErrorAction SilentlyContinue
     if ($spooler) {
         Stop-Service -Name "Spooler" -Force | Out-Null
         Set-Service -Name "Spooler" -StartupType Disabled | Out-Null
         Add-AuditEntry "Services" "Print Spooler (Spooler)" "VULNERABLE (Running on DC)" "Stopped service and set startup to Disabled"
+        Write-Output "    -> Print Spooler stopped and disabled (Anti-PrintNightmare)."
     }
 
     $sshd = Get-Service -Name "sshd" -ErrorAction SilentlyContinue
@@ -362,9 +388,10 @@ function Invoke-HardeningSequence {
         Stop-Service -Name "sshd" -Force | Out-Null
         Set-Service -Name "sshd" -StartupType Disabled | Out-Null
         Add-AuditEntry "Services" "Rogue OpenSSH (sshd)" "ROGUE BACKDOOR (Active)" "Terminated process and disabled SSH service"
+        Write-Output "    -> Rogue OpenSSH service terminated and disabled."
     }
 
-    # Backup & Purge Malicious Scheduled Tasks
+    # Purge Scheduled Tasks
     $badKeywords = @("ithelp4", "shutdown", "curl", "powershell -enc", "wget", "wsl", "certutil -urlcache")
     if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
         $tasks = Get-ScheduledTask -ErrorAction SilentlyContinue
@@ -373,10 +400,10 @@ function Invoke-HardeningSequence {
             $actionsStr = ($t.Actions | Out-String)
             foreach ($kw in $badKeywords) {
                 if ($actionsStr -match [regex]::Escape($kw) -or $taskName -match [regex]::Escape($kw)) {
-                    # Backup task XML before deleting
                     cmd.exe /c "schtasks.exe /query /tn `"$taskName`" /xml" > "$BackupRoot\Tasks\$taskName.xml" 2>$null
                     Unregister-ScheduledTask -TaskName $taskName -TaskPath $t.TaskPath -Confirm:$false | Out-Null
                     Add-AuditEntry "Persistence" "Task: $taskName" "MALICIOUS (Matched: $kw)" "Backed up XML to disk and purged task"
+                    Write-Output ("    -> Purged Malicious Scheduled Task: " + $taskName)
                     break
                 }
             }
@@ -389,6 +416,7 @@ function Invoke-HardeningSequence {
         Get-CimInstance -Namespace root\subscription -ClassName $cClass -ErrorAction SilentlyContinue | ForEach-Object {
             Add-AuditEntry "Persistence" ("WMI: " + $_.Name) "ROGUE PERSISTENCE" "Purged event consumer from root\subscription"
             Remove-CimInstance -InputObject $_ | Out-Null
+            Write-Output ("    -> Purged WMI Consumer: " + $_.Name)
         }
     }
     Get-CimInstance -Namespace root\subscription -ClassName __EventFilter -ErrorAction SilentlyContinue | ForEach-Object {
@@ -398,13 +426,13 @@ function Invoke-HardeningSequence {
         Remove-CimInstance -InputObject $_ | Out-Null
     }
 
-    # Executive Summary Report
+    # Final Audit Summary Table
     Write-Output "`n=========================================================================================================="
     Write-Output "                         CCDC REMEDIATION & HARDENING AUDIT REPORT                                "
     Write-Output "=========================================================================================================="
     Write-Output ("{0,-16} {1,-26} {2,-30} {3}" -f "CATEGORY", "TARGET COMPONENT", "STATE DETECTED", "ACTION TAKEN / REMEDIATION")
     Write-Output ("{0,-16} {1,-26} {2,-30} {3}" -f "========", "================", "==============", "==========================")
-    foreach ($entry in $script:auditLog) {
+    foreach ($entry in $global:auditLog) {
         Write-Output ("{0,-16} {1,-26} {2,-30} {3}" -f $entry.Category, $entry.Target, $entry.StateFound, $entry.ActionTaken)
     }
     Write-Output "=========================================================================================================="
