@@ -1,9 +1,3 @@
-<#
-.SYNOPSIS
-    Universal OpenSSH Server installer for Windows Server (2012 through 2025).
-    Configures password-only authentication, disables ssh-agent, and applies hardening.
-#>
-
 # 0. Ensure script is run with Administrator privileges
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Error "Please Run as Administrator."
@@ -29,11 +23,35 @@ if ($osInfo.ProductType -eq 2) {
     Write-Log "Notice: Host is running as Member Server/Standalone (ProductType: $($osInfo.ProductType))." "Yellow"
 }
 
-# 2. Install OpenSSH
+# =========================================================================
+# STEP 1: Audit Backup (Preserve existing configs & keys for triage)
+# =========================================================================
+$hasDataToBackup = (Test-Path "$env:ProgramData\ssh") -or (Test-Path "$env:ProgramFiles\OpenSSH")
+
+if ($hasDataToBackup) {
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $backupDir = "C:\SSH_Audit_Backup_$timestamp"
+    Write-Log "Existing SSH files found. Creating audit backup at: $backupDir..." "Yellow"
+
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+
+    # Copy files safely without stopping anything prematurely
+    if (Test-Path "$env:ProgramData\ssh") {
+        Copy-Item -Path "$env:ProgramData\ssh" -Destination "$backupDir\ProgramData_ssh" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path "$env:ProgramFiles\OpenSSH") {
+        Copy-Item -Path "$env:ProgramFiles\OpenSSH" -Destination "$backupDir\ProgramFiles_OpenSSH" -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Log "Audit backup preserved successfully." "Green"
+}
+
+# =========================================================================
+# STEP 2: Install OpenSSH
+# =========================================================================
 if ($build -ge 17763) {
-    # =========================================================================
+    # -------------------------------------------------------------
     # Windows Server 2019 / 2022 / 2025 (Native Feature-on-Demand)
-    # =========================================================================
+    # -------------------------------------------------------------
     Write-Log "Checking OpenSSH Server capability..."
     $capability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
 
@@ -50,9 +68,9 @@ if ($build -ge 17763) {
     }
 
 } else {
-    # =========================================================================
+    # -------------------------------------------------------------
     # Windows Server 2012 / 2012 R2 / 2016 (Win32-OpenSSH Release)
-    # =========================================================================
+    # -------------------------------------------------------------
     Write-Log "Installing Win32-OpenSSH package for legacy server..."
     $installDir = "$env:ProgramFiles\OpenSSH"
     if (-not (Test-Path $installDir)) {
@@ -90,24 +108,32 @@ if ($build -ge 17763) {
     powershell.exe -ExecutionPolicy Bypass -File "$installDir\install-sshd.ps1"
 }
 
-# 3. Permanently Disable ssh-agent (Attack Surface Reduction)
+# =========================================================================
+# STEP 3: Permanently Disable ssh-agent (Reduces Attack Surface)
+# =========================================================================
 Write-Log "Ensuring ssh-agent is disabled..."
 if (Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue) {
     Stop-Service -Name "ssh-agent" -Force -ErrorAction SilentlyContinue
     Set-Service -Name "ssh-agent" -StartupType Disabled
 }
 
-# 4. Initial Start to Allow OpenSSH to Seed Config & Host Keys
+# =========================================================================
+# STEP 4: Initial Start (Seeds Native Config & Host Keys)
+# =========================================================================
 Write-Log "Initializing sshd service..."
 Set-Service -Name "sshd" -StartupType Automatic
 Start-Service -Name "sshd"
 
-# 5. Open Firewall Port 22 (netsh works across 2012 to 2025)
+# =========================================================================
+# STEP 5: Open Firewall Port 22
+# =========================================================================
 Write-Log "Opening Firewall Port 22..."
 & netsh advfirewall firewall delete rule name="OpenSSH-Server (TCP-In)" protocol=TCP localport=22 | Out-Null
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
 
-# 6. Apply In-Place Edits to sshd_config (Password Auth + Anti-Red Team Hardening)
+# =========================================================================
+# STEP 6: Apply In-Place Edits to sshd_config (Password Auth + Hardening)
+# =========================================================================
 Write-Log "Configuring sshd_config for Password-Only & Hardening..."
 $configPath = "$env:ProgramData\ssh\sshd_config"
 
@@ -117,17 +143,17 @@ Start-Sleep -Seconds 2
 if (Test-Path $configPath) {
     $content = Get-Content $configPath
 
-    # Force Password Authentication ON, Public Keys OFF
+    # 1. Force Password Authentication ON, Public Keys OFF
     $content = $content -replace '#?PasswordAuthentication\s+(yes|no)', 'PasswordAuthentication yes'
     $content = $content -replace '#?KbdInteractiveAuthentication\s+(yes|no)', 'KbdInteractiveAuthentication yes'
     $content = $content -replace '#?PubkeyAuthentication\s+(yes|no)', 'PubkeyAuthentication no'
 
-    # Comment out the Match Group administrators authorized_keys directive
+    # 2. Comment out the Match Group administrators authorized_keys directive
     $joined = $content -join "`n"
     $joined = $joined -replace 'Match Group administrators', '#Match Group administrators'
     $joined = $joined -replace 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys', '#AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
 
-    # Append Anti-Red Team Hardening safely to bottom
+    # 3. Append Anti-Red Team Hardening
     $hardenedBlock = @"
 
 # --- Security Hardening ---
@@ -149,7 +175,9 @@ MaxAuthTries 3
     Set-Content -Path $configPath -Value $joined
 }
 
-# 7. Restart to Apply Changes
+# =========================================================================
+# STEP 7: Restart to Apply Changes
+# =========================================================================
 Write-Log "Restarting sshd to apply settings..."
 Restart-Service -Name "sshd"
 Write-Log "OpenSSH Server Setup Complete! Ready for password login." "Green"
