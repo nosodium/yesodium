@@ -19,27 +19,16 @@ if ((Test-Path "$env:ProgramData\ssh") -or (Test-Path "$env:ProgramFiles\OpenSSH
 }
 
 # =========================================================================
-# STEP 2: Locate or Deploy sshd.exe (NO Windows Update / NO Hanging)
+# STEP 2: Extract Clean OpenSSH Binaries
 # =========================================================================
-$sshdBin = ""
+$installDir = "$env:ProgramFiles\OpenSSH"
+New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+$sshdBin = "$installDir\sshd.exe"
 
-if (Test-Path "$env:SystemRoot\System32\OpenSSH\sshd.exe") {
-    # Windows Server 2025 / 2022 (Built-in on disk)
-    Write-Log "Found native OpenSSH binaries on disk in System32." "Green"
-    $sshdBin = "$env:SystemRoot\System32\OpenSSH\sshd.exe"
-
-    # Register service if not already registered
-    if (-not (Get-Service -Name "sshd" -ErrorAction SilentlyContinue)) {
-        & sc.exe create sshd binPath= "$sshdBin" start= auto DisplayName= "OpenSSH SSH Server" | Out-Null
-    }
-
-} else {
-    # Windows Server 2012 / 2012 R2 / 2016 (Download package)
-    Write-Log "Legacy server detected. Fetching standalone package..." "Yellow"
-    $installDir = "$env:ProgramFiles\OpenSSH"
-    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+# If sshd.exe does not exist in Program Files, download and extract it
+if (-not (Test-Path $sshdBin)) {
+    Write-Log "Downloading clean OpenSSH package..." "Yellow"
     $zipPath = "$env:TEMP\OpenSSH-Win64.zip"
-    
     (New-Object System.Net.WebClient).DownloadFile("https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip", $zipPath)
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -59,14 +48,26 @@ if (Test-Path "$env:SystemRoot\System32\OpenSSH\sshd.exe") {
     }
     $archive.Dispose()
     Remove-Item -Path $zipPath -Force
-
-    $sshdBin = "$installDir\sshd.exe"
-    Set-Location -Path $installDir
-    powershell.exe -ExecutionPolicy Bypass -File "$installDir\install-sshd.ps1"
 }
 
 # =========================================================================
-# STEP 3: Generate Host Keys & Initialize Folder
+# STEP 3: Register sshd Service Directly (Bypasses Buggy install-sshd.ps1)
+# =========================================================================
+Write-Log "Registering sshd service directly via Service Manager..."
+if (-not (Get-Service -Name "sshd" -ErrorAction SilentlyContinue)) {
+    & sc.exe create sshd binPath= "`"$sshdBin`"" start= auto DisplayName= "OpenSSH SSH Server" | Out-Null
+} else {
+    & sc.exe config sshd binPath= "`"$sshdBin`"" start= auto | Out-Null
+}
+
+# Ensure ssh-agent is completely removed/disabled
+if (Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue) {
+    Stop-Service -Name "ssh-agent" -Force -ErrorAction SilentlyContinue
+    Set-Service -Name "ssh-agent" -StartupType Disabled
+}
+
+# =========================================================================
+# STEP 4: Initialize Directory & Generate Host Keys
 # =========================================================================
 $programDataSSH = "$env:ProgramData\ssh"
 $activeConfig   = "$programDataSSH\sshd_config"
@@ -75,17 +76,16 @@ if (-not (Test-Path $programDataSSH)) {
     New-Item -ItemType Directory -Path $programDataSSH -Force | Out-Null
 }
 
-$keygen = Join-Path (Split-Path $sshdBin) "ssh-keygen.exe"
+$keygen = Join-Path $installDir "ssh-keygen.exe"
 if (Test-Path $keygen) {
-    Write-Log "Ensuring host keys exist..."
+    Write-Log "Generating host keys..."
     & $keygen -A | Out-Null
 }
 
 # =========================================================================
-# STEP 4: Write Clean Hardened Config (Safe for All Versions)
+# STEP 5: Write Hardened Configuration
 # =========================================================================
-Write-Log "Writing safe hardened configuration..."
-
+Write-Log "Deploying hardened configuration..."
 $hardenedConfig = @"
 Port 22
 
@@ -124,14 +124,16 @@ LogLevel VERBOSE
 Set-Content -Path $activeConfig -Value $hardenedConfig -Encoding UTF8
 
 # =========================================================================
-# STEP 5: Service Management (Disable ssh-agent, Start sshd)
+# STEP 6: Fix Permissions with Native icacls (Never Crashes on .NET Bug)
 # =========================================================================
-Write-Log "Disabling ssh-agent to minimize attack surface..."
-if (Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue) {
-    Stop-Service -Name "ssh-agent" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "ssh-agent" -StartupType Disabled
-}
+Write-Log "Applying strict permissions via native icacls..."
+# Reset ProgramData\ssh permissions strictly to SYSTEM and BUILTIN\Administrators
+& icacls.exe "$programDataSSH" /inheritance:r /grant "SYSTEM:(OI)(CI)F" /grant "BUILTIN\Administrators:(OI)(CI)F" | Out-Null
+& icacls.exe "$installDir" /inheritance:r /grant "SYSTEM:(OI)(CI)F" /grant "BUILTIN\Administrators:(OI)(CI)F" /grant "BUILTIN\Users:(OI)(CI)RX" | Out-Null
 
+# =========================================================================
+# STEP 7: Firewall & Start Service
+# =========================================================================
 Write-Log "Configuring Windows Firewall..."
 & netsh advfirewall firewall delete rule name="OpenSSH-Server (TCP-In)" protocol=TCP localport=22 | Out-Null
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
@@ -141,5 +143,5 @@ Set-Service -Name "sshd" -StartupType Automatic
 Restart-Service -Name "sshd"
 
 Write-Log "SUCCESS! OpenSSH is running and hardened." "Green"
-Write-Log "Login Method: Password Only (No SSH keys required)" "Yellow"
+Write-Log "Login Method: Password Only" "Yellow"
 Write-Log "Allowed Group: BUILTIN\Administrators (Domain Admins)" "Yellow"
