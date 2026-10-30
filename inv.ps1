@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    CCDC Universal Inventory & Baseline Engine (v10 - Plain Text / No Color Conflicts)
+    CCDC Universal Inventory & Baseline Engine (v11 - One User Per Line)
 .DESCRIPTION
-    Zero PS5+ dependencies. 100% compatible across Windows Server 2012 to 2025.
+    Zero PS5+ dependencies. Compatible across Windows Server 2012 to 2025.
 #>
 
 # ====================================================================
@@ -46,8 +46,9 @@ function Show-UsersAndGroups {
     Write-Output "`n[+] LOCAL ACCOUNTS (MEMBER SERVERS / STANDALONE)"
     $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue
     if ($localUsers) {
-        foreach ($user in $localUsers) {
-            Write-Output ("Account: {0,-25} | Disabled: {1,-5} | PasswordChangeable: {2}" -f $user.Name, $user.Disabled, $user.PasswordChangeable)
+        Write-Output "[*] Local Accounts List (One Per Line):"
+        foreach ($user in ($localUsers | Sort-Object Name)) {
+            Write-Output $user.Name
         }
     } else {
         Write-Output "No local SAM accounts found (Standard behavior for Domain Controllers)."
@@ -57,28 +58,34 @@ function Show-UsersAndGroups {
     try {
         $adminGroup = Get-CimInstance Win32_Group -Filter "LocalAccount=True AND SID='S-1-5-32-544'" -ErrorAction Stop
         $admins = Get-CimInstance -Query "ASSOCIATORS OF {Win32_Group.Domain='$($env:COMPUTERNAME)',Name='$($adminGroup.Name)'} WHERE ResultClass=Win32_UserAccount"
-        Write-Output ("Members: {0}" -f ($admins.Name -join ', '))
+        foreach ($admin in $admins.Name) {
+            Write-Output ("  - " + $admin)
+        }
     } catch {
         $netAdmin = (net localgroup administrators | Select-Object -Skip 6) -notmatch "The command completed" | Where-Object { $_ -ne "" }
-        Write-Output ("Members: {0}" -f ($netAdmin -join ', '))
+        foreach ($admin in $netAdmin) {
+            Write-Output ("  - " + $admin.Trim())
+        }
     }
 
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         Write-Output "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS"
+        Write-Output "Domain Admins:"
         try {
             $da = Get-ADGroupMember -Identity "Domain Admins" -Recursive -ErrorAction Stop | Select-Object -ExpandProperty SamAccountName
-            Write-Output ("Domain Admins     : {0}" -f ($da -join ', '))
+            foreach ($u in $da) { Write-Output ("  - " + $u) }
         } catch {
             $netDA = (net group "Domain Admins" /domain 2>$null | Select-Object -Skip 6) -notmatch "The command completed" | Where-Object { $_ -ne "" }
-            Write-Output ("Domain Admins     : {0}" -f ($netDA -join ', '))
+            foreach ($u in $netDA) { Write-Output ("  - " + $u.Trim()) }
         }
 
+        Write-Output "Enterprise Admins:"
         try {
             $ea = Get-ADGroupMember -Identity "Enterprise Admins" -Recursive -ErrorAction Stop | Select-Object -ExpandProperty SamAccountName
-            Write-Output ("Enterprise Admins : {0}" -f ($ea -join ', '))
+            foreach ($u in $ea) { Write-Output ("  - " + $u) }
         } catch {
             $netEA = (net group "Enterprise Admins" /domain 2>$null | Select-Object -Skip 6) -notmatch "The command completed" | Where-Object { $_ -ne "" }
-            Write-Output ("Enterprise Admins : {0}" -f ($netEA -join ', '))
+            foreach ($u in $netEA) { Write-Output ("  - " + $u.Trim()) }
         }
 
         Write-Output "`n[+] ALL DOMAIN USERS (RECURSIVE SEARCH ACROSS ALL OUs)"
@@ -127,13 +134,18 @@ function Show-UsersAndGroups {
         }
 
         if ($userObjects.Count -gt 0) {
-            $namesOnly = ($userObjects | Select-Object -ExpandProperty SamAccountName) -join ', '
-            Write-Output ("Accounts List: " + $namesOnly)
+            Write-Output "`n--- DOMAIN USERS LIST (ONE PER LINE) ---"
+            foreach ($name in ($userObjects | Select-Object -ExpandProperty SamAccountName | Sort-Object)) {
+                if ($name.EndsWith("$")) { continue }
+                Write-Output $name
+            }
+            Write-Output "----------------------------------------"
 
             Write-Output ("`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH")
             Write-Output ("{0,-25} {1,-8} {2}" -f "============", "=======", "===========================")
             
             foreach ($u in ($userObjects | Sort-Object OU, SamAccountName)) {
+                if ($u.SamAccountName.EndsWith("$")) { continue }
                 Write-Output ("{0,-25} {1,-8} {2}" -f $u.SamAccountName, $u.Enabled, $u.OU)
             }
         } else {
@@ -247,7 +259,7 @@ function Show-InstalledAppsAndFeatures {
         Write-Output "Get-WindowsFeature cmdlet not supported on this operating system."
     }
 
-    Write-Output "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)"
+    Write-Host "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)"
     $regPaths = @(
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
@@ -271,7 +283,7 @@ while ($true) {
     Write-Output "             CCDC SYSTEM AUDIT & INVENTORY MENU         "
     Write-Output "========================================================"
     Write-Output "[1] System & Network Configuration (IP, Gateway, DNS, MAC)"
-    Write-Output "[2] Local & Domain Accounts / Privileged Groups / ADUC Users"
+    Write-Output "[2] Local & Domain Accounts / Privileged Groups / Users List"
     Write-Output "[3] Core Active Directory & Infrastructure Services Status"
     Write-Output "[4] Third-Party & Non-Default Services (Unquoted Paths)"
     Write-Output "[5] Installed Applications & Enabled Windows Features"
