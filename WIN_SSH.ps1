@@ -1,39 +1,105 @@
-# Enforce TLS 1.2
+# 0. Ensure script is run with Administrator privileges
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error "Please Run as Administrator."
+    exit 1
+}
+
+Write-Host "--- Starting OpenSSH Server Setup ---" -ForegroundColor Cyan
+
+# 1. Query and install the OpenSSH Server capability
+Write-Host "Checking OpenSSH Server capability..." -ForegroundColor Yellow
+$capability = Get-WindowsCapability -Online | Where-Object Name -like 'OpenSSH.Server*'
+# Enforce TLS 1.2 for all downloads
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = "Stop"
 
+if (-not $capability) {
+    Write-Error "OpenSSH Server capability was not found on this system."
+    exit 1
 function Write-Log([string]$msg, [string]$color = "Cyan") {
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor $color
 }
 
-# =========================================================================
-# STEP 1: Audit Backup (Preserves previous files before touching anything)
-# =========================================================================
-if ((Test-Path "$env:ProgramData\ssh") -or (Test-Path "$env:ProgramFiles\OpenSSH")) {
-    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $backupDir = "C:\SSH_Audit_Backup_$timestamp"
-    Write-Log "Backing up existing SSH files to $backupDir..." "Yellow"
-    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-    if (Test-Path "$env:ProgramData\ssh") { Copy-Item -Path "$env:ProgramData\ssh" -Destination "$backupDir\ProgramData_ssh" -Recurse -Force -ErrorAction SilentlyContinue }
-    if (Test-Path "$env:ProgramFiles\OpenSSH") { Copy-Item -Path "$env:ProgramFiles\OpenSSH" -Destination "$backupDir\ProgramFiles_OpenSSH" -Recurse -Force -ErrorAction SilentlyContinue }
+if ($capability.State -ne 'Installed') {
+    Write-Host "Installing $($capability.Name)..." -ForegroundColor Yellow
+    Add-WindowsCapability -Online -Name $capability.Name
+    Write-Host "OpenSSH Server installed successfully." -ForegroundColor Green
+# 1. Verify DC & Architecture
+$osInfo = Get-WmiObject -Class Win32_OperatingSystem
+$build  = [System.Environment]::OSVersion.Version.Build
+
+Write-Log "Target: $($osInfo.Caption) (Build: $build)"
+if ($osInfo.ProductType -eq 2) {
+    Write-Log "Active Directory Domain Controller confirmed." "Green"
+} else {
+    Write-Host "OpenSSH Server is already installed." -ForegroundColor Green
+    Write-Log "Notice: Host is running as Member Server/Standalone (ProductType: $($osInfo.ProductType))." "Yellow"
 }
 
-# =========================================================================
-# STEP 2: Extract Clean OpenSSH Binaries
-# =========================================================================
-$installDir = "$env:ProgramFiles\OpenSSH"
-New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-$sshdBin = "$installDir\sshd.exe"
+# 2. Configure and start the sshd service
+Write-Host "Configuring 'sshd' service..." -ForegroundColor Yellow
+Set-Service -Name sshd -StartupType 'Automatic'
+Start-Service -Name sshd
+Write-Host "'sshd' service set to Automatic and started." -ForegroundColor Green
 
-# If sshd.exe does not exist in Program Files, download and extract it
-if (-not (Test-Path $sshdBin)) {
-    Write-Log "Downloading clean OpenSSH package..." "Yellow"
+# 3. Check and configure the firewall rule
+Write-Host "Configuring firewall rule..." -ForegroundColor Yellow
+$ruleName = "OpenSSH-Server-In-TCP"
+
+if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+    Write-Host "Firewall Rule '$ruleName' does not exist, creating it..." -ForegroundColor Yellow
+    New-NetFirewallRule -Name $ruleName `
+                        -DisplayName 'OpenSSH Server (sshd)' `
+                        -Enabled True `
+                        -Direction Inbound `
+                        -Protocol TCP `
+                        -Action Allow `
+                        -LocalPort 22 `
+                        -Profile Any | Out-Null
+    Write-Host "Firewall rule created successfully." -ForegroundColor Green
+# 2. Install OpenSSH
+if ($build -ge 17763) {
+    # =========================================================================
+    # Windows Server 2019 / 2022 / 2025 (Native Feature-on-Demand)
+    # =========================================================================
+    Write-Log "Installing native OpenSSH Capability..."
+    $capability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
+
+    if ($capability.State -ne 'Installed') {
+        try {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
+        } catch {
+            Write-Log "Add-WindowsCapability blocked (likely WSUS GPO). Falling back to DISM..." "Yellow"
+            dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /LimitAccess
+        }
+    } else {
+        Write-Log "OpenSSH Server capability is already installed." "Green"
+    }
+
+} else {
+    Write-Host "Firewall rule '$ruleName' has been created and exists." -ForegroundColor Green
+    # =========================================================================
+    # Windows Server 2012 / 2012 R2 / 2016 (Win32-OpenSSH Release)
+    # =========================================================================
+    Write-Log "Installing Win32-OpenSSH package for legacy server..."
+    $installDir = "$env:ProgramFiles\OpenSSH"
+    if (-not (Test-Path $installDir)) {
+        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    }
+
     $zipPath = "$env:TEMP\OpenSSH-Win64.zip"
-    (New-Object System.Net.WebClient).DownloadFile("https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip", $zipPath)
+    $downloadUrl = "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip"
 
+    Write-Log "Downloading latest release..."
+    (New-Object System.Net.WebClient).DownloadFile($downloadUrl, $zipPath)
+
+    Write-Log "Extracting binaries..."
+    # .NET 4.5+ zip extraction (natively available on Server 2012+)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+    
     foreach ($entry in $archive.Entries) {
+        # Strip the root directory (OpenSSH-Win64/) so files extract directly into $installDir
         $relPath = ($entry.FullName -split '/', 2)[1]
         if (-not [string]::IsNullOrEmpty($relPath)) {
             $targetPath = Join-Path $installDir $relPath
@@ -48,100 +114,50 @@ if (-not (Test-Path $sshdBin)) {
     }
     $archive.Dispose()
     Remove-Item -Path $zipPath -Force
+
+    # Run Win32-OpenSSH setup script
+    Set-Location -Path $installDir
+    powershell.exe -ExecutionPolicy Bypass -File "$installDir\install-sshd.ps1"
 }
 
-# =========================================================================
-# STEP 3: Register sshd Service Directly (Bypasses Buggy install-sshd.ps1)
-# =========================================================================
-Write-Log "Registering sshd service directly via Service Manager..."
-if (-not (Get-Service -Name "sshd" -ErrorAction SilentlyContinue)) {
-    & sc.exe create sshd binPath= "`"$sshdBin`"" start= auto DisplayName= "OpenSSH SSH Server" | Out-Null
-} else {
-    & sc.exe config sshd binPath= "`"$sshdBin`"" start= auto | Out-Null
-}
+# Ensure profile is applied to Any
+Set-NetFirewallRule -Name $ruleName -Profile Any
+Write-Host "Firewall rule profile set to 'Any'." -ForegroundColor Green
+# 3. Configure Services & Initial Start
+Write-Log "Configuring sshd service..."
+Set-Service -Name "sshd" -StartupType Automatic
+Start-Service -Name "sshd"
 
-# Ensure ssh-agent is completely removed/disabled
-if (Get-Service -Name "ssh-agent" -ErrorAction SilentlyContinue) {
-    Stop-Service -Name "ssh-agent" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "ssh-agent" -StartupType Disabled
-}
-
-# =========================================================================
-# STEP 4: Initialize Directory & Generate Host Keys
-# =========================================================================
-$programDataSSH = "$env:ProgramData\ssh"
-$activeConfig   = "$programDataSSH\sshd_config"
-
-if (-not (Test-Path $programDataSSH)) {
-    New-Item -ItemType Directory -Path $programDataSSH -Force | Out-Null
-}
-
-$keygen = Join-Path $installDir "ssh-keygen.exe"
-if (Test-Path $keygen) {
-    Write-Log "Generating host keys..."
-    & $keygen -A | Out-Null
-}
-
-# =========================================================================
-# STEP 5: Write Hardened Configuration
-# =========================================================================
-Write-Log "Deploying hardened configuration..."
-$hardenedConfig = @"
-Port 22
-
-# Host Keys
-HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key
-HostKey __PROGRAMDATA__/ssh/ssh_host_ecdsa_key
-HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key
-
-# --- Authentication (Password Only) ---
-PasswordAuthentication yes
-KbdInteractiveAuthentication yes
-PubkeyAuthentication no
-MaxAuthTries 3
-LoginGraceTime 30
-MaxStartups 1:100:1
-
-# --- Account Whitelisting (Restricted to Administrators) ---
-AllowGroups Administrators
-
-# --- Anti-Pivoting / Forwarding Defense ---
-AllowTcpForwarding no
-AllowAgentForwarding no
-GatewayPorts no
-PermitTunnel no
-X11Forwarding no
-
-# --- Session Restrictions ---
-MaxSessions 1
-ClientAliveInterval 300
-ClientAliveCountMax 0
-
-# --- Logging ---
-LogLevel VERBOSE
-"@
-
-Set-Content -Path $activeConfig -Value $hardenedConfig -Encoding UTF8
-
-# =========================================================================
-# STEP 6: Fix Permissions with Native icacls (Never Crashes on .NET Bug)
-# =========================================================================
-Write-Log "Applying strict permissions via native icacls..."
-# Reset ProgramData\ssh permissions strictly to SYSTEM and BUILTIN\Administrators
-& icacls.exe "$programDataSSH" /inheritance:r /grant "SYSTEM:(OI)(CI)F" /grant "BUILTIN\Administrators:(OI)(CI)F" | Out-Null
-& icacls.exe "$installDir" /inheritance:r /grant "SYSTEM:(OI)(CI)F" /grant "BUILTIN\Administrators:(OI)(CI)F" /grant "BUILTIN\Users:(OI)(CI)RX" | Out-Null
-
-# =========================================================================
-# STEP 7: Firewall & Start Service
-# =========================================================================
-Write-Log "Configuring Windows Firewall..."
+# 4. Open Firewall Port 22
+Write-Log "Adding Port 22 to Windows Firewall..."
 & netsh advfirewall firewall delete rule name="OpenSSH-Server (TCP-In)" protocol=TCP localport=22 | Out-Null
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
 
-Write-Log "Starting sshd service..."
-Set-Service -Name "sshd" -StartupType Automatic
-Restart-Service -Name "sshd"
+# 5. Lock Down sshd_config strictly for PASSWORD authentication
+Write-Log "Configuring sshd_config for password-only authentication..."
+$configPath = "$env:ProgramData\ssh\sshd_config"
 
-Write-Log "SUCCESS! OpenSSH is running and hardened." "Green"
-Write-Log "Login Method: Password Only" "Yellow"
-Write-Log "Allowed Group: BUILTIN\Administrators (Domain Admins)" "Yellow"
+# Wait briefly for sshd to initialize files on first run
+Start-Sleep -Seconds 2
+
+if (Test-Path $configPath) {
+    $content = Get-Content $configPath
+
+    # Force Password Authentication on
+    $content = $content -replace '#?PasswordAuthentication\s+(yes|no)', 'PasswordAuthentication yes'
+    $content = $content -replace '#?KbdInteractiveAuthentication\s+(yes|no)', 'KbdInteractiveAuthentication yes'
+
+    # Turn off public key demand so it immediately presents the password prompt
+    $content = $content -replace '#?PubkeyAuthentication\s+(yes|no)', 'PubkeyAuthentication no'
+
+    # Disable the Match Group administrators authorized_keys directive
+    $joined = $content -join "`n"
+    $joined = $joined -replace 'Match Group administrators', '#Match Group administrators'
+    $joined = $joined -replace 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys', '#AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
+
+    Set-Content -Path $configPath -Value $joined
+}
+
+Write-Host "--- OpenSSH Server Setup Complete! ---" -ForegroundColor Cyan
+Restart-Service -Name "sshd"
+Write-Log "Setup complete! Domain Controller is ready for password SSH login." "Green"
