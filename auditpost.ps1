@@ -15,7 +15,7 @@ $netlogon = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\
 Test-Check "ZeroLogon (FullSecureChannel)" ($netlogon -eq 1) "Registry Value = $netlogon (Expected: 1)"
 
 # 2. Machine Account Quota (NoPac)
-$quota = ([ADSI]"LDAP://$([ADSI]'LDAP://RootDSE').defaultNamingContext").Properties["ms-DS-MachineAccountQuota"].Value
+$quota = ([ADSI]"LDAP://$(([ADSI]'LDAP://RootDSE').defaultNamingContext)").Properties["ms-DS-MachineAccountQuota"].Value
 Test-Check "NoPac (MachineAccountQuota)" ($quota -eq 0) "Domain Quota = $quota (Expected: 0)"
 
 # 3. Kerberos AES Encryption
