@@ -2,9 +2,7 @@
 .SYNOPSIS
     Interactive Controlled Credential Rotation (Server 2012-2025 Compatible)
 .DESCRIPTION
-    Iterates through local accounts and Domain Admins, prompting the engineer
-    to change the password, skip, or apply a specific custom passphrase.
-    All colors removed.
+    Zero non-ASCII symbols. 100% pure ASCII text.
 #>
 
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
@@ -26,7 +24,7 @@ function Set-UserCredentialPrompt {
 
     $passSecure = Read-Host "Enter new password (masked)" -AsSecureString
     
-    # PS 4.0 / Server 2012 R2 compatible credential conversion (replaces ::new())
+    # PS 4.0 / Server 2012 R2 compatible conversion
     $passPlain = (New-Object System.Net.NetworkCredential('', $passSecure)).Password
 
     if ([string]::IsNullOrWhiteSpace($passPlain)) {
@@ -46,14 +44,15 @@ function Set-UserCredentialPrompt {
             Write-Output "[+] Domain account $Username password successfully updated."
         }
     } catch {
-        Write-Output "[-] Failed to set password for $Username: $_"
+        # Fixed: Isolated string variables to prevent colon scope errors
+        Write-Output ("[-] Failed to set password for {0}: {1}" -f $Username, $_.Exception.Message)
     }
     return $true
 }
 
 Write-Output "=== CCDC INTERACTIVE CREDENTIAL ROTATION ==="
 
-# 1. Local Accounts (Applies to member servers and standalone hosts)
+# 1. Local Accounts (Member servers and standalone hosts)
 $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 if ($localUsers) {
     foreach ($lUser in $localUsers) {
@@ -62,7 +61,7 @@ if ($localUsers) {
     }
 }
 
-# 2. Domain Admins (Applies to Domain Controllers)
+# 2. Domain Admins (Domain Controllers)
 if (Get-Command Get-ADGroupMember -ErrorAction SilentlyContinue) {
     $domainAdmins = Get-ADGroupMember -Identity "Domain Admins" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SamAccountName
     if ($domainAdmins) {
@@ -73,4 +72,4 @@ if (Get-Command Get-ADGroupMember -ErrorAction SilentlyContinue) {
     }
 }
 
-Write-Output "`n[✓] Credential rotation pass complete."
+Write-Output "`n[+] Credential rotation pass complete."
