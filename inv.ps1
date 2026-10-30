@@ -1,20 +1,16 @@
 <#
 .SYNOPSIS
-    CCDC Interactive Inventory & Baseline Engine (v3 - Third-Party Service Auditing)
+    CCDC Universal Inventory & Threat Baseline Engine
 .DESCRIPTION
-    Collects system, network, listener, account, core infrastructure, and
-    third-party/non-default service telemetry with unquoted path detection.
-    Compatible with Windows Server 2012 through 2025.
+    Compatible across Windows Server 2012, 2012 R2, 2016, 2019, 2022, and 2025.
+    Audits TCP network listeners, host configs, accounts, core services,
+    and flags third-party unquoted service backdoors.
 #>
 
 [CmdletBinding()]
 param()
 
 $ErrorActionPreference = "SilentlyContinue"
-
-# ====================================================================
-# HELPER FUNCTIONS
-# ====================================================================
 
 function Show-SystemNetworkConfig {
     Write-Host "`n=================================================================" -ForegroundColor Cyan
@@ -45,20 +41,22 @@ function Show-SystemNetworkConfig {
     }
 }
 
-function Show-ActiveListeners {
+function Show-ActiveTCPListeners {
     Write-Host "`n=================================================================" -ForegroundColor Cyan
-    Write-Host "               ACTIVE LISTENERS (TCP / UDP)                      " -ForegroundColor Cyan
+    Write-Host "               ACTIVE TCP LISTENERS ONLY                         " -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Cyan
     Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "PROTO", "LOCAL ADDRESS:PORT", "PID", "PROCESS NAME") -ForegroundColor White
     Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "=====", "==============================", "===", "============") -ForegroundColor Gray
 
+    # Pre-cache process names to prevent slow repeated lookups
     $procTable = @{}
     Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[$_.Id] = $_.ProcessName }
     $procTable[0] = "System Idle"
     $procTable[4] = "System"
 
-    $resultsFound = 0
+    $tcpFound = 0
 
+    # 1. Primary: NetTCPIP module
     if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
         $tcpList = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
         foreach ($conn in $tcpList) {
@@ -66,39 +64,24 @@ function Show-ActiveListeners {
             $pidNum   = [int]$conn.OwningProcess
             $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
             
-            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $(if ($endpoint -match ":22$|:4444$|:3389$") { "Red" } else { "White" })
-            $resultsFound++
-        }
-
-        $udpList = Get-NetUDPEndpoint -ErrorAction SilentlyContinue
-        foreach ($udp in $udpList) {
-            $endpoint = "{0}:{1}" -f $udp.LocalAddress, $udp.LocalPort
-            $pidNum   = [int]$udp.OwningProcess
-            $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-            
-            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName) -ForegroundColor White
-            $resultsFound++
+            # Highlight dangerous ports in red (SSH 22, C2 mock 4444, RDP 3389)
+            $color = if ($endpoint -match ":(22|4444|3389)$") { "Red" } else { "White" }
+            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $color
+            $tcpFound++
         }
     }
 
-    if ($resultsFound -eq 0) {
+    # 2. Resilient Netstat Fallback (if Get-NetTCPConnection yields 0 results)
+    if ($tcpFound -eq 0) {
         cmd.exe /c "netstat -ano -p tcp" | Select-String "LISTENING" | ForEach-Object {
             $line = $_.Line.Trim()
             if ($line -match "^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)") {
                 $endpoint = $matches[1]
                 $pidNum   = [int]$matches[2]
                 $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $(if ($endpoint -match ":22$|:4444$|:3389$") { "Red" } else { "White" })
-            }
-        }
-
-        cmd.exe /c "netstat -ano -p udp" | ForEach-Object {
-            $line = $_.Trim()
-            if ($line -match "^\s*UDP\s+(\S+)\s+\*:\*\s+(\d+)") {
-                $endpoint = $matches[1]
-                $pidNum   = [int]$matches[2]
-                $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName) -ForegroundColor White
+                
+                $color = if ($endpoint -match ":(22|4444|3389)$") { "Red" } else { "White" }
+                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $color
             }
         }
     }
@@ -109,13 +92,17 @@ function Show-UsersAndGroups {
     Write-Host "               USERS AND PRIVILEGED GROUPS                       " -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Cyan
 
-    Write-Host "`n[+] LOCAL ACCOUNTS" -ForegroundColor Yellow
+    Write-Host "`n[+] LOCAL ACCOUNTS (MEMBER SERVERS / STANDALONE)" -ForegroundColor Yellow
     $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue
-    foreach ($user in $localUsers) {
-        Write-Output ("Account: {0,-25} | Disabled: {1,-5} | PasswordChangeable: {2}" -f $user.Name, $user.Disabled, $user.PasswordChangeable)
+    if ($localUsers) {
+        foreach ($user in $localUsers) {
+            Write-Output ("Account: {0,-25} | Disabled: {1,-5} | PasswordChangeable: {2}" -f $user.Name, $user.Disabled, $user.PasswordChangeable)
+        }
+    } else {
+        Write-Host "No local SAM accounts found (Standard behavior for Domain Controllers)." -ForegroundColor DarkGray
     }
 
-    Write-Host "`n[+] LOCAL ADMINISTRATORS" -ForegroundColor Yellow
+    Write-Host "`n[+] LOCAL / BUILTIN ADMINISTRATORS" -ForegroundColor Yellow
     try {
         $adminGroup = Get-CimInstance Win32_Group -Filter "LocalAccount=True AND SID='S-1-5-32-544'" -ErrorAction Stop
         $admins = Get-CimInstance -Query "ASSOCIATORS OF {Win32_Group.Domain='$($env:COMPUTERNAME)',Name='$($adminGroup.Name)'} WHERE ResultClass=Win32_UserAccount"
@@ -142,21 +129,28 @@ function Show-CoreServices {
     Write-Host "`n=================================================================" -ForegroundColor Cyan
     Write-Host "               CORE AD & INFRASTRUCTURE SERVICES                " -ForegroundColor Cyan
     Write-Host "=================================================================" -ForegroundColor Cyan
-    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATUS", "START TYPE", "DISPLAY NAME") -ForegroundColor White
-    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "======", "==========", "============") -ForegroundColor Gray
+    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATE", "START MODE", "DISPLAY NAME") -ForegroundColor White
+    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "=====", "==========", "============") -ForegroundColor Gray
 
-    $adServices = @(
+    $coreTargets = @(
         "NTDS", "kdc", "DNS", "Netlogon", "W32Time", 
         "RpcSs", "DFSR", "LanmanServer", "LanmanWorkstation", 
         "sshd", "wuauserv", "CertSvc"
     )
 
-    foreach ($svcName in $adServices) {
-        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-        if ($svc) {
-            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svc.Name, $svc.Status.ToString(), $svc.StartType.ToString(), $svc.DisplayName) -ForegroundColor $(if ($svcName -eq "sshd" -and $svc.Status -eq "Running") { "Red" } else { "White" })
+    $allServices = @{}
+    Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | ForEach-Object {
+        $allServices[$_.Name.ToLower()] = $_
+    }
+
+    foreach ($svcName in $coreTargets) {
+        $key = $svcName.ToLower()
+        if ($allServices.ContainsKey($key)) {
+            $s = $allServices[$key]
+            $color = if ($s.Name -eq "sshd" -and $s.State -eq "Running") { "Red" } else { "White" }
+            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $s.Name, $s.State, $s.StartMode, $s.DisplayName) -ForegroundColor $color
         } else {
-            Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", "Service not installed")
+            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", "Service not installed on this host") -ForegroundColor DarkGray
         }
     }
 }
@@ -169,22 +163,17 @@ function Show-ThirdPartyServices {
     Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "SERVICE NAME", "STATE", "STARTMODE", "PATHNAME") -ForegroundColor White
     Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "============", "=====", "=========", "========") -ForegroundColor Gray
 
-    # Enumerate all system services via CIM/WMI to pull exact executable paths
     $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
-
     $foundNonDefault = 0
+
     foreach ($s in $services) {
         $path = $s.PathName
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
 
-        # Filter out native Windows core paths: C:\Windows\system32, C:\Windows\SysWOW64, C:\Windows\WinSxS
         $isWindowsCore = $path -match "^([A-Z]:\\Windows\\(system32|SysWOW64|WinSxS|servicing)\b|system32\\)"
 
         if (-not $isWindowsCore) {
             $foundNonDefault++
-
-            # Check for Unquoted Service Path Vulnerability:
-            # Contains space in directory path, doesn't start with quote, and ends in .exe
             $isUnquoted = ($path -notmatch '^"') -and ($path -match '\.exe(\s|$)') -and ($path -match ' ')
 
             $color = "Yellow"
@@ -234,10 +223,10 @@ while ($true) {
     Write-Host "`n========================================================" -ForegroundColor Cyan
     Write-Host "             CCDC SYSTEM AUDIT & INVENTORY MENU         " -ForegroundColor Cyan
     Write-Host "========================================================" -ForegroundColor Cyan
-    Write-Host "[1] Active Network Listeners (TCP & UDP with PID/Process)" -ForegroundColor Yellow
+    Write-Host "[1] Active Network Listeners (TCP Only with PID/Process)" -ForegroundColor Yellow
     Write-Host "[2] System & Network Configuration (IP, Gateway, DNS, MAC)"
     Write-Host "[3] Local & Domain Accounts / Privileged Groups"
-    Write-Host "[4] Core Active Directory & Infrastructure Services Status"
+    Write-Host "[4] Core Active Directory & Infrastructure Services Status" -ForegroundColor Yellow
     Write-Host "[5] Third-Party & Non-Default Services (Unquoted Paths)" -ForegroundColor Yellow
     Write-Host "[6] Installed Applications & Enabled Windows Features"
     Write-Host "[A] Run FULL Inventory (All Modules - for Copy-Pasting)" -ForegroundColor Green
@@ -247,7 +236,7 @@ while ($true) {
     $choice = Read-Host "Select an option [1-6, A, Q]"
 
     switch ($choice.ToUpper()) {
-        "1" { Show-ActiveListeners }
+        "1" { Show-ActiveTCPListeners }
         "2" { Show-SystemNetworkConfig }
         "3" { Show-UsersAndGroups }
         "4" { Show-CoreServices }
@@ -255,7 +244,7 @@ while ($true) {
         "6" { Show-InstalledAppsAndFeatures }
         "A" {
             Show-SystemNetworkConfig
-            Show-ActiveListeners
+            Show-ActiveTCPListeners
             Show-UsersAndGroups
             Show-CoreServices
             Show-ThirdPartyServices
