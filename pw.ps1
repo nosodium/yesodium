@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Interactive Controlled Credential Rotation (All Domain Users - Switch Fix)
+    Interactive Controlled Credential Rotation (Unmasked Plain Text Input)
 .DESCRIPTION
     Iterates through all Local Accounts and ALL Active Directory Domain Users.
-    Compatible across Windows Server 2012 to 2025. Pure ASCII.
+    Displays typed passwords in plain text. Compatible across Windows Server 2012 to 2025.
 #>
 
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
@@ -22,15 +22,16 @@ function Set-UserCredentialPrompt {
         return $true 
     }
 
-    $passSecure = Read-Host "Enter new password for $Username (masked)" -AsSecureString
-    
-    # PS 4.0 / Server 2012 R2 compatible credential conversion
-    $passPlain = (New-Object System.Net.NetworkCredential('', $passSecure)).Password
+    # Plain text input so characters are fully visible on screen
+    $passPlain = Read-Host "Enter new password for $Username"
 
     if ([string]::IsNullOrWhiteSpace($passPlain)) {
         [Console]::WriteLine("[-] Password cannot be empty. Skipped $Username.")
         return $true
     }
+
+    # Convert plain text to SecureString for Active Directory cmdlet
+    $passSecure = ConvertTo-SecureString $passPlain -AsPlainText -Force
 
     try {
         if ($Type -eq "Local") {
@@ -39,7 +40,6 @@ function Set-UserCredentialPrompt {
             $user.SetInfo()
             [Console]::WriteLine("[+] Local account '$Username' password updated successfully.")
         } elseif ($Type -eq "Domain") {
-            # Fixed: -Reset is a switch parameter and does not take $true
             Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset
             Set-ADUser -Identity $Username -PasswordNeverExpires $true
             [Console]::WriteLine("[+] Domain user '$Username' password updated successfully.")
