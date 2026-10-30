@@ -16,7 +16,7 @@ $build  = [System.Environment]::OSVersion.Version.Build
 Write-Log "Target: $($osInfo.Caption) (Build: $build) | Domain: $domainName"
 
 # =========================================================================
-# STEP 1: Audit Backup of Existing Installation
+# STEP 1: Audit Backup of Existing Installation & Clean Slate
 # =========================================================================
 $hasCapability = $false
 if (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue) {
@@ -47,7 +47,6 @@ if ($hasCapability -or $hasService -or $hasFiles) {
 
     Write-Log "Purging old components..." "Yellow"
     if ($hasCapability) {
-        # Quick dism removal rather than slow capability cmdlet
         & dism.exe /Online /Remove-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /NoRestart | Out-Null
     }
     if (Test-Path "$env:ProgramFiles\OpenSSH\uninstall-sshd.ps1") {
@@ -62,9 +61,9 @@ if ($hasCapability -or $hasService -or $hasFiles) {
 }
 
 # =========================================================================
-# STEP 2: Fast Direct Download (Bypasses Windows Update Completely)
+# STEP 2: Fast Direct Download (Bypasses Windows Update)
 # =========================================================================
-Write-Log "Downloading OpenSSH directly from GitHub (bypassing Windows Update)..."
+Write-Log "Downloading OpenSSH directly from GitHub..."
 $installDir = "$env:ProgramFiles\OpenSSH"
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
@@ -112,12 +111,11 @@ if (Test-Path $keygen) {
 }
 
 # =========================================================================
-# STEP 4: Write Hardened sshd_config
+# STEP 4: Write Hardened sshd_config (Protocol line removed)
 # =========================================================================
 Write-Log "Deploying hardened configuration..."
 $hardenedConfig = @"
 Port 22
-Protocol 2
 
 HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key
 HostKey __PROGRAMDATA__/ssh/ssh_host_ecdsa_key
@@ -158,16 +156,12 @@ LogLevel VERBOSE
 Set-Content -Path $activeConfig -Value $hardenedConfig -Encoding UTF8
 
 # =========================================================================
-# STEP 5: Lock Down ACLs
+# STEP 5: Apply Permissions to Keys & Config
 # =========================================================================
-$acl = Get-Acl $activeConfig
-$acl.SetAccessRuleProtection($true, $false)
-$systemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
-$adminSid  = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
-
-$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, "FullControl", "Allow")))
-$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($adminSid, "FullControl", "Allow")))
-Set-Acl -Path $activeConfig -AclObject $acl
+Write-Log "Setting strict permissions on host keys and config..."
+if (Test-Path "$installDir\FixHostFilePermissions.ps1") {
+    powershell.exe -ExecutionPolicy Bypass -File "$installDir\FixHostFilePermissions.ps1" -Confirm:$false | Out-Null
+}
 
 # =========================================================================
 # STEP 6: Firewall & Start
@@ -176,7 +170,7 @@ Set-Acl -Path $activeConfig -AclObject $acl
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
 
 Set-Service -Name "sshd" -StartupType Automatic
-Restart-Service -Name "sshd"
+Start-Service -Name "sshd"
 
-Write-Log "INSTALLATION COMPLETE in seconds!" "Green"
+Write-Log "SUCCESS! OpenSSH is running and fully hardened." "Green"
 Write-Log "Allowed Account: $allowDirective" "Yellow"
