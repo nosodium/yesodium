@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Interactive Controlled Credential Rotation (All Domain Users)
+    Interactive Controlled Credential Rotation (All Domain Users - Switch Fix)
 .DESCRIPTION
     Iterates through all Local Accounts and ALL Active Directory Domain Users.
     Compatible across Windows Server 2012 to 2025. Pure ASCII.
@@ -14,7 +14,6 @@ function Set-UserCredentialPrompt {
         [string]$Type
     )
 
-    # Prompt explicitly displays account type and target username
     $choice = Read-Host "`nChange password for [$Type User: $Username]? ([Y]es / [S]kip / [Q]uit)"
     
     if ($choice -eq 'Q' -or $choice -eq 'q') { return $false }
@@ -40,7 +39,8 @@ function Set-UserCredentialPrompt {
             $user.SetInfo()
             [Console]::WriteLine("[+] Local account '$Username' password updated successfully.")
         } elseif ($Type -eq "Domain") {
-            Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset $true
+            # Fixed: -Reset is a switch parameter and does not take $true
+            Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset
             Set-ADUser -Identity $Username -PasswordNeverExpires $true
             [Console]::WriteLine("[+] Domain user '$Username' password updated successfully.")
         }
@@ -54,7 +54,7 @@ function Set-UserCredentialPrompt {
 [Console]::WriteLine("             CCDC INTERACTIVE CREDENTIAL ROTATION                ")
 [Console]::WriteLine("=================================================================")
 
-# 1. Local Accounts (Applies to Member Servers & Standalone hosts)
+# 1. Local Accounts (Member Servers & Standalone hosts)
 $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
 if ($localUsers) {
     [Console]::WriteLine("[*] Checking Local Accounts...")
@@ -92,11 +92,9 @@ if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         } catch {}
     }
 
-    # Prompt through all discovered domain users
     if ($allDomainUsers.Count -gt 0) {
         [Console]::WriteLine("[+] Discovered " + $allDomainUsers.Count + " total domain users.")
         foreach ($dUser in ($allDomainUsers | Sort-Object)) {
-            # Skip computer accounts (ending in $)
             if ($dUser.EndsWith("$")) { continue }
 
             $continue = Set-UserCredentialPrompt -Username $dUser -Type "Domain"
