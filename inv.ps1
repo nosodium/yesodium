@@ -1,18 +1,9 @@
 <#
 .SYNOPSIS
-    CCDC Universal Inventory & Baseline Engine (v7)
+    CCDC Universal Inventory & Baseline Engine (v8 - PS 4.0 / Server 2012 R2 Compatible)
 .DESCRIPTION
-    Compatible with Windows Server 2012 through 2025.
-    - ADUC All Domain Users listing (comma-separated)
-    - Clean human-readable display names for Core AD services
-    - Refined third-party service detection (filters out ADWS / .NET)
-    - Unquoted service path detection
+    Zero PS5+ syntax dependencies. Compatible with Windows Server 2012 through 2025.
 #>
-
-[CmdletBinding()]
-param()
-
-$ErrorActionPreference = "SilentlyContinue"
 
 # ====================================================================
 # HELPER FUNCTIONS
@@ -72,7 +63,6 @@ function Show-UsersAndGroups {
         Write-Output ("Members: {0}" -f ($netAdmin -join ', '))
     }
 
-    # Domain Controller / Active Directory Queries
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
         Write-Host "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS" -ForegroundColor Yellow
         try {
@@ -91,24 +81,62 @@ function Show-UsersAndGroups {
             Write-Output ("Enterprise Admins : {0}" -f ($netEA -join ', '))
         }
 
-        # ALL ADUC DOMAIN USERS (Comma-Separated)
-        Write-Host "`n[+] ALL DOMAIN USERS (ADUC)" -ForegroundColor Yellow
-        $allDomainUsers = @()
+        Write-Host "`n[+] ALL DOMAIN USERS (RECURSIVE SEARCH ACROSS ALL OUs)" -ForegroundColor Yellow
+        $userObjects = @()
+
+        # Method 1: ActiveDirectory module
         if (Get-Command Get-ADUser -ErrorAction SilentlyContinue) {
-            $allDomainUsers = Get-ADUser -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SamAccountName
+            $userObjects = Get-ADUser -Filter * -Properties DistinguishedName, Enabled -ErrorAction SilentlyContinue | ForEach-Object {
+                $ouPath = ($_.DistinguishedName -split ',', 2)[1]
+                New-Object PSObject -Property @{
+                    SamAccountName = $_.SamAccountName
+                    Name           = $_.Name
+                    Enabled        = $_.Enabled
+                    OU             = $ouPath
+                }
+            }
         }
         
-        # Fallback to DirectorySearcher if AD module is missing or fails
-        if (-not $allDomainUsers -or $allDomainUsers.Count -eq 0) {
+        # Method 2: ADSI Fallback (PowerShell 4.0 / 3.0 Compatible)
+        if (-not $userObjects -or $userObjects.Count -eq 0) {
             try {
-                $searcher = [adsisearcher]"(objectCategory=user)"
+                $rootDSE = [ADSI]"LDAP://RootDSE"
+                $defaultNamingContext = $rootDSE.defaultNamingContext
+                $ldapRoot = [ADSI]"LDAP://$defaultNamingContext"
+                
+                # Use New-Object instead of ::new() for Server 2012 / PS 4.0 compatibility
+                $searcher = New-Object System.DirectoryServices.DirectorySearcher($ldapRoot)
+                $searcher.Filter = "(&(objectCategory=person)(objectClass=user))"
                 $searcher.PageSize = 1000
-                $allDomainUsers = $searcher.FindAll() | ForEach-Object { $_.Properties["samaccountname"] }
+                $searcher.SearchScope = [System.DirectoryServices.SearchScope]::Subtree
+                
+                $results = $searcher.FindAll()
+                foreach ($r in $results) {
+                    $dn = [string]$r.Properties["distinguishedname"]
+                    $ouPath = ($dn -split ',', 2)[1]
+                    $userAccountControl = [int]$r.Properties["useraccountcontrol"][0]
+                    $isEnabled = (-not ($userAccountControl -band 2))
+                    
+                    $userObjects += New-Object PSObject -Property @{
+                        SamAccountName = [string]$r.Properties["samaccountname"]
+                        Name           = [string]$r.Properties["name"]
+                        Enabled        = $isEnabled
+                        OU             = $ouPath
+                    }
+                }
             } catch {}
         }
 
-        if ($allDomainUsers) {
-            Write-Output ($allDomainUsers -join ', ')
+        if ($userObjects.Count -gt 0) {
+            $namesOnly = ($userObjects | Select-Object -ExpandProperty SamAccountName) -join ', '
+            Write-Output ("Accounts List: " + $namesOnly)
+
+            Write-Host "`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH" -ForegroundColor White
+            Write-Host "{0,-25} {1,-8} {2}" -f "============", "=======", "===========================" -ForegroundColor Gray
+            foreach ($u in ($userObjects | Sort-Object OU, SamAccountName)) {
+                $color = if ($u.Enabled) { "White" } else { "DarkGray" }
+                Write-Host ("{0,-25} {1,-8} {2}" -f $u.SamAccountName, $u.Enabled, $u.OU) -ForegroundColor $color
+            }
         } else {
             Write-Host "Could not query Active Directory user accounts." -ForegroundColor Red
         }
@@ -145,7 +173,7 @@ function Show-CoreServices {
         4 = "Disabled"
     }
 
-    foreach ($svcName in $coreTargets.Keys | Sort-Object) {
+    foreach ($svcName in ($coreTargets.Keys | Sort-Object)) {
         $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$svcName"
         
         if (Test-Path $regPath) {
@@ -191,13 +219,11 @@ function Show-ThirdPartyServices {
         $path = $s.PathName
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
 
-        # Filter out built-in Windows paths, including ADWS, Microsoft.NET, servicing, and SysWOW64
         $isWindowsCore = $path -match "^([A-Z]:\\Windows\\(system32|SysWOW64|WinSxS|servicing|ADWS|Microsoft\.NET)\b|system32\\)"
 
         if (-not $isWindowsCore) {
             $foundNonDefault++
 
-            # Detect unquoted service path vulnerability
             $isUnquoted = ($path -notmatch '^"') -and ($path -match '\.exe(\s|$)') -and ($path -match ' ')
 
             $color = "Yellow"
