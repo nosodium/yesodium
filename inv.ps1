@@ -1,3 +1,11 @@
+<#
+.SYNOPSIS
+    CCDC Interactive Inventory & Baseline Engine (Hardened Listener Parser)
+.DESCRIPTION
+    Collects system, network, listener, account, service, and installed application
+    telemetry. Built specifically to handle Windows Server 2012 through 2025 without crashing.
+#>
+
 [CmdletBinding()]
 param()
 
@@ -8,14 +16,14 @@ $ErrorActionPreference = "SilentlyContinue"
 # ====================================================================
 
 function Show-SystemNetworkConfig {
-    Write-Output "`n================================================================="
-    Write-Output "               SYSTEM & NETWORK INTERFACE BASELINE               "
-    Write-Output "================================================================="
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "               SYSTEM & NETWORK INTERFACE BASELINE               " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
     
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
     
-    Write-Output "`n[+] HOST CONFIGURATION"
+    Write-Host "`n[+] HOST CONFIGURATION" -ForegroundColor Yellow
     Write-Output ("Hostname        : {0}" -f $env:COMPUTERNAME)
     Write-Output ("Domain / Workgr : {0}" -f $cs.Domain)
     Write-Output ("OS Caption      : {0}" -f $os.Caption)
@@ -23,7 +31,7 @@ function Show-SystemNetworkConfig {
     Write-Output ("Architecture    : {0}" -f $os.OSArchitecture)
     Write-Output ("Last Boot Time  : {0}" -f $os.LastBootUpTime)
 
-    Write-Output "`n[+] NETWORK INTERFACES"
+    Write-Host "`n[+] NETWORK INTERFACES" -ForegroundColor Yellow
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) {
         Write-Output "---------------------------------------------------------"
@@ -37,120 +45,94 @@ function Show-SystemNetworkConfig {
 }
 
 function Show-ActiveListeners {
-    Write-Output "`n================================================================="
-    Write-Output "               ACTIVE LISTENERS (TCP / UDP)                      "
-    Write-Output "================================================================="
-    Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "PROTO", "LOCAL ADDRESS:PORT", "PID", "PROCESS NAME")
-    Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "=====", "==============================", "===", "============")
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "               ACTIVE LISTENERS (TCP / UDP)                      " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "PROTO", "LOCAL ADDRESS:PORT", "PID", "PROCESS NAME") -ForegroundColor White
+    Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "=====", "==============================", "===", "============") -ForegroundColor Gray
 
-    # 1. TCP Listeners
-    $tcpFound = $false
-    try {
-        $tcpConnections = Get-NetTCPConnection -State Listen -ErrorAction Stop
-        $tcpFound = $true
-        foreach ($conn in $tcpConnections) {
+    # Cache all current processes by PID for rapid lookup without repeated calls
+    $procTable = @{}
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[$_.Id] = $_.ProcessName }
+    $procTable[0] = "System Idle"
+    $procTable[4] = "System"
+
+    $resultsFound = 0
+
+    # Primary method: PowerShell NetTCPIP cmdlets
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        $tcpList = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
+        foreach ($conn in $tcpList) {
             $endpoint = "{0}:{1}" -f $conn.LocalAddress, $conn.LocalPort
-            $pidNum   = $conn.OwningProcess
-            $pName    = "UNKNOWN"
-
-            if ($pidNum -eq 0) {
-                $pName = "System Idle"
-            } elseif ($pidNum -eq 4) {
-                $pName = "System"
-            } else {
-                $p = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
-                if ($p) { $pName = $p.ProcessName }
-            }
-            Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName)
+            $pidNum   = [int]$conn.OwningProcess
+            $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
+            
+            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $(if ($endpoint -match ":22$|:4444$|:3389$") { "Red" } else { "White" })
+            $resultsFound++
         }
-    } catch {}
 
-    # Netstat fallback for minimal environments (Win Server 2012 / missing NetTCPIP module)
-    if (-not $tcpFound) {
-        netstat -ano -p tcp | Select-String "LISTENING" | ForEach-Object {
-            $tokens = ($_.ToString().Trim() -split '\s+')
-            if ($tokens.Count -ge 5) {
-                $endpoint = $tokens[1]
-                $pidNum   = $tokens[4]
-                $pName    = "UNKNOWN"
-                if ($pidNum -eq "0") { $pName = "System Idle" }
-                elseif ($pidNum -eq "4") { $pName = "System" }
-                else {
-                    $p = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
-                    if ($p) { $pName = $p.ProcessName }
-                }
-                Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName)
-            }
+        $udpList = Get-NetUDPEndpoint -ErrorAction SilentlyContinue
+        foreach ($udp in $udpList) {
+            $endpoint = "{0}:{1}" -f $udp.LocalAddress, $udp.LocalPort
+            $pidNum   = [int]$udp.OwningProcess
+            $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
+            
+            Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName) -ForegroundColor White
+            $resultsFound++
         }
     }
 
-    # 2. UDP Listeners
-    $udpFound = $false
-    try {
-        $udpEndpoints = Get-NetUDPEndpoint -ErrorAction Stop
-        $udpFound = $true
-        foreach ($udp in $udpEndpoints) {
-            $endpoint = "{0}:{1}" -f $udp.LocalAddress, $udp.LocalPort
-            $pidNum   = $udp.OwningProcess
-            $pName    = "UNKNOWN"
-
-            if ($pidNum -eq 0) {
-                $pName = "System Idle"
-            } elseif ($pidNum -eq 4) {
-                $pName = "System"
-            } else {
-                $p = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
-                if ($p) { $pName = $p.ProcessName }
+    # Universal Netstat Fallback: Executes if cmdlets returned nothing or threw errors
+    if ($resultsFound -eq 0) {
+        # Netstat TCP Listeners
+        cmd.exe /c "netstat -ano -p tcp" | Select-String "LISTENING" | ForEach-Object {
+            $line = $_.Line.Trim()
+            if ($line -match "^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)") {
+                $endpoint = $matches[1]
+                $pidNum   = [int]$matches[2]
+                $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
+                
+                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $(if ($endpoint -match ":22$|:4444$|:3389$") { "Red" } else { "White" })
             }
-            Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName)
         }
-    } catch {}
 
-    # Netstat fallback for UDP
-    if (-not $udpFound) {
-        netstat -ano -p udp | ForEach-Object {
-            $tokens = ($_.ToString().Trim() -split '\s+')
-            if ($tokens.Count -ge 4 -and $tokens[0] -eq "UDP") {
-                $endpoint = $tokens[1]
-                $pidNum   = $tokens[3]
-                $pName    = "UNKNOWN"
-                if ($pidNum -eq "0") { $pName = "System Idle" }
-                elseif ($pidNum -eq "4") { $pName = "System" }
-                else {
-                    $p = Get-Process -Id $pidNum -ErrorAction SilentlyContinue
-                    if ($p) { $pName = $p.ProcessName }
-                }
-                Write-Output ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName)
+        # Netstat UDP Endpoints
+        cmd.exe /c "netstat -ano -p udp" | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -match "^\s*UDP\s+(\S+)\s+\*:\*\s+(\d+)") {
+                $endpoint = $matches[1]
+                $pidNum   = [int]$matches[2]
+                $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
+                
+                Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName) -ForegroundColor White
             }
         }
     }
 }
 
 function Show-UsersAndGroups {
-    Write-Output "`n================================================================="
-    Write-Output "               USERS AND PRIVILEGED GROUPS                       "
-    Write-Output "================================================================="
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "               USERS AND PRIVILEGED GROUPS                       " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
 
-    Write-Output "`n[+] LOCAL ACCOUNTS"
+    Write-Host "`n[+] LOCAL ACCOUNTS" -ForegroundColor Yellow
     $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue
     foreach ($user in $localUsers) {
         Write-Output ("Account: {0,-25} | Disabled: {1,-5} | PasswordChangeable: {2}" -f $user.Name, $user.Disabled, $user.PasswordChangeable)
     }
 
-    Write-Output "`n[+] LOCAL ADMINISTRATORS"
+    Write-Host "`n[+] LOCAL ADMINISTRATORS" -ForegroundColor Yellow
     try {
         $adminGroup = Get-CimInstance Win32_Group -Filter "LocalAccount=True AND SID='S-1-5-32-544'" -ErrorAction Stop
         $admins = Get-CimInstance -Query "ASSOCIATORS OF {Win32_Group.Domain='$($env:COMPUTERNAME)',Name='$($adminGroup.Name)'} WHERE ResultClass=Win32_UserAccount"
         Write-Output ("Members: {0}" -f ($admins.Name -join ', '))
     } catch {
-        # Fallback to net localgroup
         $netAdmin = (net localgroup administrators | Select-Object -Skip 6) -notmatch "The command completed" | Where-Object { $_ -ne "" }
         Write-Output ("Members: {0}" -f ($netAdmin -join ', '))
     }
 
-    # Domain users check (if AD module is present)
     if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain -and (Get-Command Get-ADUser -ErrorAction SilentlyContinue)) {
-        Write-Output "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS"
+        Write-Host "`n[+] ACTIVE DIRECTORY PRIVILEGED GROUPS" -ForegroundColor Yellow
         try {
             $da = Get-ADGroupMember -Identity "Domain Admins" -Recursive | Select-Object -ExpandProperty SamAccountName
             Write-Output ("Domain Admins     : {0}" -f ($da -join ', '))
@@ -163,11 +145,11 @@ function Show-UsersAndGroups {
 }
 
 function Show-CoreServices {
-    Write-Output "`n================================================================="
-    Write-Output "               CORE AD & INFRASTRUCTURE SERVICES                "
-    Write-Output "================================================================="
-    Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATUS", "START TYPE", "DISPLAY NAME")
-    Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "======", "==========", "============")
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "               CORE AD & INFRASTRUCTURE SERVICES                " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "SERVICE NAME", "STATUS", "START TYPE", "DISPLAY NAME") -ForegroundColor White
+    Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f "============", "======", "==========", "============") -ForegroundColor Gray
 
     $adServices = @(
         "NTDS", "kdc", "DNS", "Netlogon", "W32Time", 
@@ -178,7 +160,7 @@ function Show-CoreServices {
     foreach ($svcName in $adServices) {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc) {
-            Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f $svc.Name, $svc.Status.ToString(), $svc.StartType.ToString(), $svc.DisplayName)
+            Write-Host ("{0,-20} {1,-12} {2,-12} {3}" -f $svc.Name, $svc.Status.ToString(), $svc.StartType.ToString(), $svc.DisplayName) -ForegroundColor $(if ($svcName -eq "sshd" -and $svc.Status -eq "Running") { "Red" } else { "White" })
         } else {
             Write-Output ("{0,-20} {1,-12} {2,-12} {3}" -f $svcName, "NOT PRESENT", "N/A", "Service not installed")
         }
@@ -186,20 +168,20 @@ function Show-CoreServices {
 }
 
 function Show-InstalledAppsAndFeatures {
-    Write-Output "`n================================================================="
-    Write-Output "               INSTALLED APPLICATIONS & FEATURES                 "
-    Write-Output "================================================================="
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "               INSTALLED APPLICATIONS & FEATURES                 " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
 
-    Write-Output "`n[+] INSTALLED WINDOWS FEATURES (ACTIVE)"
+    Write-Host "`n[+] INSTALLED WINDOWS FEATURES (ACTIVE)" -ForegroundColor Yellow
     if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) {
         Get-WindowsFeature | Where-Object { $_.Installed -eq $true } | ForEach-Object {
             Write-Output ("Feature: {0,-32} | {1}" -f $_.Name, $_.DisplayName)
         }
     } else {
-        Write-Output "Get-WindowsFeature cmdlet not supported on this workstation or environment."
+        Write-Output "Get-WindowsFeature cmdlet not supported on this operating system."
     }
 
-    Write-Output "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)"
+    Write-Host "`n[+] INSTALLED SOFTWARE (REGISTRY RUNTIME)" -ForegroundColor Yellow
     $regPaths = @(
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
@@ -240,9 +222,9 @@ while ($true) {
             Show-UsersAndGroups
             Show-CoreServices
             Show-InstalledAppsAndFeatures
-            Write-Output "`n================================================================="
-            Write-Output "                   FULL BASELINE COMPLETED                       "
-            Write-Output "================================================================="
+            Write-Host "`n=================================================================" -ForegroundColor Green
+            Write-Host "                   FULL BASELINE COMPLETED                       " -ForegroundColor Green
+            Write-Host "=================================================================" -ForegroundColor Green
         }
         "Q" {
             Write-Host "`nExiting CCDC Inventory Tool." -ForegroundColor Gray
