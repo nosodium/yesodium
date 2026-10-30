@@ -1,4 +1,4 @@
-# Enforce TLS 1.2 for all downloads
+# Enforce TLS 1.2
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 $ErrorActionPreference = "Stop"
 
@@ -6,59 +6,87 @@ function Write-Log([string]$msg, [string]$color = "Cyan") {
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $msg" -ForegroundColor $color
 }
 
-# 1. Verify DC & Architecture
+# --- Account Configuration ---
+$domainName  = (Get-WmiObject Win32_ComputerSystem).Domain.Split('.')[0]
+$allowedUser = "Administrator"
+$allowDirective = "$domainName\$allowedUser $allowedUser"
+
 $osInfo = Get-WmiObject -Class Win32_OperatingSystem
 $build  = [System.Environment]::OSVersion.Version.Build
+Write-Log "Target: $($osInfo.Caption) (Build: $build) | Domain: $domainName"
 
-Write-Log "Target: $($osInfo.Caption) (Build: $build)"
-if ($osInfo.ProductType -eq 2) {
-    Write-Log "Active Directory Domain Controller confirmed." "Green"
-} else {
-    Write-Log "Notice: Host is running as Member Server/Standalone (ProductType: $($osInfo.ProductType))." "Yellow"
+# =========================================================================
+# STEP 1: Audit Backup of Old Installation
+# =========================================================================
+$hasCapability = $false
+if (Get-Command Get-WindowsCapability -ErrorAction SilentlyContinue) {
+    $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' -and $_.State -eq 'Installed' }
+    if ($cap) { $hasCapability = $true }
+}
+$hasService = [bool](Get-Service -Name "sshd" -ErrorAction SilentlyContinue)
+$hasFiles   = (Test-Path "$env:ProgramData\ssh") -or (Test-Path "$env:ProgramFiles\OpenSSH")
+
+if ($hasCapability -or $hasService -or $hasFiles) {
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $backupDir = "C:\SSH_Audit_Backup_$timestamp"
+    Write-Log "Existing installation found. Backing up to $backupDir..." "Yellow"
+    
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+
+    Stop-Service -Name "sshd" -Force -ErrorAction SilentlyContinue
+    Stop-Service -Name "ssh-agent" -Force -ErrorAction SilentlyContinue
+    Get-Process -Name sshd, ssh-agent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    if (Test-Path "$env:ProgramData\ssh") {
+        Copy-Item -Path "$env:ProgramData\ssh" -Destination "$backupDir\ProgramData_ssh" -Recurse -Force
+    }
+    if (Test-Path "$env:ProgramFiles\OpenSSH") {
+        Copy-Item -Path "$env:ProgramFiles\OpenSSH" -Destination "$backupDir\ProgramFiles_OpenSSH" -Recurse -Force
+    }
+
+    Write-Log "Purging old OpenSSH components..." "Yellow"
+    if ($hasCapability) {
+        Remove-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction SilentlyContinue | Out-Null
+    }
+    if (Test-Path "$env:ProgramFiles\OpenSSH\uninstall-sshd.ps1") {
+        powershell.exe -ExecutionPolicy Bypass -File "$env:ProgramFiles\OpenSSH\uninstall-sshd.ps1" | Out-Null
+    }
+
+    & sc.exe delete sshd | Out-Null
+    & sc.exe delete ssh-agent | Out-Null
+
+    Remove-Item -Path "$env:ProgramData\ssh" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$env:ProgramFiles\OpenSSH" -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# 2. Install OpenSSH
+# =========================================================================
+# STEP 2: Clean Slate Install
+# =========================================================================
+$sshBinPath = ""
+
 if ($build -ge 17763) {
-    # =========================================================================
-    # Windows Server 2019 / 2022 / 2025 (Native Feature-on-Demand)
-    # =========================================================================
+    # Windows Server 2019, 2022, 2025
     Write-Log "Installing native OpenSSH Capability..."
-    $capability = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' }
-
-    if ($capability.State -ne 'Installed') {
-        try {
-            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
-        } catch {
-            Write-Log "Add-WindowsCapability blocked (likely WSUS GPO). Falling back to DISM..." "Yellow"
-            dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /LimitAccess
-        }
-    } else {
-        Write-Log "OpenSSH Server capability is already installed." "Green"
+    try {
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 -ErrorAction Stop
+    } catch {
+        dism /Online /Add-Capability /CapabilityName:OpenSSH.Server~~~~0.0.1.0 /LimitAccess
     }
-
+    $sshBinPath = "$env:SystemRoot\System32\OpenSSH"
 } else {
-    # =========================================================================
-    # Windows Server 2012 / 2012 R2 / 2016 (Win32-OpenSSH Release)
-    # =========================================================================
-    Write-Log "Installing Win32-OpenSSH package for legacy server..."
+    # Windows Server 2012, 2012 R2, 2016
+    Write-Log "Deploying Win32-OpenSSH package..."
     $installDir = "$env:ProgramFiles\OpenSSH"
-    if (-not (Test-Path $installDir)) {
-        New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    }
+    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
     $zipPath = "$env:TEMP\OpenSSH-Win64.zip"
     $downloadUrl = "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip"
-
-    Write-Log "Downloading latest release..."
     (New-Object System.Net.WebClient).DownloadFile($downloadUrl, $zipPath)
 
-    Write-Log "Extracting binaries..."
-    # .NET 4.5+ zip extraction (natively available on Server 2012+)
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-    
     foreach ($entry in $archive.Entries) {
-        # Strip the root directory (OpenSSH-Win64/) so files extract directly into $installDir
         $relPath = ($entry.FullName -split '/', 2)[1]
         if (-not [string]::IsNullOrEmpty($relPath)) {
             $targetPath = Join-Path $installDir $relPath
@@ -74,45 +102,113 @@ if ($build -ge 17763) {
     $archive.Dispose()
     Remove-Item -Path $zipPath -Force
 
-    # Run Win32-OpenSSH setup script
     Set-Location -Path $installDir
     powershell.exe -ExecutionPolicy Bypass -File "$installDir\install-sshd.ps1"
+    $sshBinPath = $installDir
 }
 
-# 3. Configure Services & Initial Start
-Write-Log "Configuring sshd service..."
-Set-Service -Name "sshd" -StartupType Automatic
-Start-Service -Name "sshd"
+# =========================================================================
+# STEP 3: Setup Directory and Host Keys
+# =========================================================================
+$programDataSSH = "$env:ProgramData\ssh"
+$activeConfig   = "$programDataSSH\sshd_config"
 
-# 4. Open Firewall Port 22
-Write-Log "Adding Port 22 to Windows Firewall..."
+if (-not (Test-Path $programDataSSH)) {
+    New-Item -ItemType Directory -Path $programDataSSH -Force | Out-Null
+}
+
+$keygen = Join-Path $sshBinPath "ssh-keygen.exe"
+if (Test-Path $keygen) {
+    Write-Log "Generating fresh host keys..."
+    & $keygen -A | Out-Null
+}
+
+# =========================================================================
+# STEP 4: Write Hardened sshd_config (Anti-Red Team)
+# =========================================================================
+Write-Log "Deploying hardened configuration to $activeConfig..."
+
+$hardenedConfig = @"
+# =====================================================
+# HARDENED OPENSSH SERVER CONFIGURATION (DOMAIN CONTROLLER)
+# =====================================================
+Port 22
+Protocol 2
+
+# Host Key algorithms
+HostKey __PROGRAMDATA__/ssh/ssh_host_rsa_key
+HostKey __PROGRAMDATA__/ssh/ssh_host_ecdsa_key
+HostKey __PROGRAMDATA__/ssh/ssh_host_ed25519_key
+
+# --- Cryptographic Hardening (Modern Ciphers Only) ---
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256
+
+# --- Anti-Brute Force & Authentication Controls ---
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication no
+MaxAuthTries 3
+LoginGraceTime 30
+MaxStartups 1:100:1
+
+# --- User Whitelisting (Deny all except designated Admin) ---
+AllowUsers $allowDirective
+
+# --- Anti-Pivoting & Tunneling Defense ---
+AllowTcpForwarding no
+AllowAgentForwarding no
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+
+# --- Anti-Persistence & Inactive Session Termination ---
+# Single session channel per network connection
+MaxSessions 1
+# Drop idle sessions after 5 minutes of inactivity (300 seconds)
+ClientAliveInterval 300
+ClientAliveCountMax 0
+
+# --- Forensics & Event Logging ---
+LogLevel VERBOSE
+
+# --- Payload Dropping Defense ---
+# SFTP disabled to stop red teams from staging payloads/exfiltrating data
+# Subsystem sftp sftp-server.exe
+"@
+
+Set-Content -Path $activeConfig -Value $hardenedConfig -Encoding UTF8
+
+# =========================================================================
+# STEP 5: Lock Down File ACLs (System & Builtin Admins Only)
+# =========================================================================
+Write-Log "Securing file permissions on $activeConfig..."
+$acl = Get-Acl $activeConfig
+$acl.SetAccessRuleProtection($true, $false) # Strip all inherited AD domain permissions
+
+$systemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18") # SYSTEM
+$adminSid  = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544") # BUILTIN\Administrators
+
+$systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule($systemSid, "FullControl", "Allow")
+$adminRule  = New-Object System.Security.AccessControl.FileSystemAccessRule($adminSid, "FullControl", "Allow")
+
+$acl.AddAccessRule($systemRule)
+$acl.AddAccessRule($adminRule)
+Set-Acl -Path $activeConfig -AclObject $acl
+
+# =========================================================================
+# STEP 6: Firewall & Service Start
+# =========================================================================
 & netsh advfirewall firewall delete rule name="OpenSSH-Server (TCP-In)" protocol=TCP localport=22 | Out-Null
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
 
-# 5. Lock Down sshd_config strictly for PASSWORD authentication
-Write-Log "Configuring sshd_config for password-only authentication..."
-$configPath = "$env:ProgramData\ssh\sshd_config"
-
-# Wait briefly for sshd to initialize files on first run
-Start-Sleep -Seconds 2
-
-if (Test-Path $configPath) {
-    $content = Get-Content $configPath
-
-    # Force Password Authentication on
-    $content = $content -replace '#?PasswordAuthentication\s+(yes|no)', 'PasswordAuthentication yes'
-    $content = $content -replace '#?KbdInteractiveAuthentication\s+(yes|no)', 'KbdInteractiveAuthentication yes'
-
-    # Turn off public key demand so it immediately presents the password prompt
-    $content = $content -replace '#?PubkeyAuthentication\s+(yes|no)', 'PubkeyAuthentication no'
-
-    # Disable the Match Group administrators authorized_keys directive
-    $joined = $content -join "`n"
-    $joined = $joined -replace 'Match Group administrators', '#Match Group administrators'
-    $joined = $joined -replace 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys', '#AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
-
-    Set-Content -Path $configPath -Value $joined
-}
-
+Set-Service -Name "sshd" -StartupType Automatic
 Restart-Service -Name "sshd"
-Write-Log "Setup complete! Domain Controller is ready for password SSH login." "Green"
+
+Write-Log "HARDENED SETUP COMPLETE!" "Green"
+Write-Log "Allowed Account    : $allowDirective" "Yellow"
+Write-Log "Port Forwarding    : BLOCKED (No pivoting/SOCKS tunnels)" "Yellow"
+Write-Log "SFTP File Transfer : BLOCKED (No payload staging)" "Yellow"
+Write-Log "Idle Session Drop  : 5 minutes" "Yellow"
+Write-Log "Max Auth Attempts  : 3" "Yellow"
