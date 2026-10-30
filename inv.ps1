@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    CCDC Universal Inventory & Baseline Engine (v8 - PS 4.0 / Server 2012 R2 Compatible)
+    CCDC Universal Inventory & Baseline Engine (v9 - Bug Fix)
 .DESCRIPTION
     Zero PS5+ syntax dependencies. Compatible with Windows Server 2012 through 2025.
 #>
@@ -104,7 +104,6 @@ function Show-UsersAndGroups {
                 $defaultNamingContext = $rootDSE.defaultNamingContext
                 $ldapRoot = [ADSI]"LDAP://$defaultNamingContext"
                 
-                # Use New-Object instead of ::new() for Server 2012 / PS 4.0 compatibility
                 $searcher = New-Object System.DirectoryServices.DirectorySearcher($ldapRoot)
                 $searcher.Filter = "(&(objectCategory=person)(objectClass=user))"
                 $searcher.PageSize = 1000
@@ -131,8 +130,10 @@ function Show-UsersAndGroups {
             $namesOnly = ($userObjects | Select-Object -ExpandProperty SamAccountName) -join ', '
             Write-Output ("Accounts List: " + $namesOnly)
 
-            Write-Host "`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH" -ForegroundColor White
-            Write-Host "{0,-25} {1,-8} {2}" -f "============", "=======", "===========================" -ForegroundColor Gray
+            # Fixed: Properly wrapped in parentheses so -f does not bind to -ForegroundColor
+            Write-Host ("`n{0,-25} {1,-8} {2}" -f "USER ACCOUNT", "ENABLED", "ORGANIZATIONAL UNIT / PATH") -ForegroundColor White
+            Write-Host ("{0,-25} {1,-8} {2}" -f "============", "=======", "===========================") -ForegroundColor Gray
+            
             foreach ($u in ($userObjects | Sort-Object OU, SamAccountName)) {
                 $color = if ($u.Enabled) { "White" } else { "DarkGray" }
                 Write-Host ("{0,-25} {1,-8} {2}" -f $u.SamAccountName, $u.Enabled, $u.OU) -ForegroundColor $color
