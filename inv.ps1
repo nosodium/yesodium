@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-    CCDC Interactive Inventory & Baseline Engine (Hardened Listener Parser)
+    CCDC Interactive Inventory & Baseline Engine (v3 - Third-Party Service Auditing)
 .DESCRIPTION
-    Collects system, network, listener, account, service, and installed application
-    telemetry. Built specifically to handle Windows Server 2012 through 2025 without crashing.
+    Collects system, network, listener, account, core infrastructure, and
+    third-party/non-default service telemetry with unquoted path detection.
+    Compatible with Windows Server 2012 through 2025.
 #>
 
 [CmdletBinding()]
@@ -51,7 +52,6 @@ function Show-ActiveListeners {
     Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "PROTO", "LOCAL ADDRESS:PORT", "PID", "PROCESS NAME") -ForegroundColor White
     Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "=====", "==============================", "===", "============") -ForegroundColor Gray
 
-    # Cache all current processes by PID for rapid lookup without repeated calls
     $procTable = @{}
     Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $procTable[$_.Id] = $_.ProcessName }
     $procTable[0] = "System Idle"
@@ -59,7 +59,6 @@ function Show-ActiveListeners {
 
     $resultsFound = 0
 
-    # Primary method: PowerShell NetTCPIP cmdlets
     if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
         $tcpList = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue
         foreach ($conn in $tcpList) {
@@ -82,28 +81,23 @@ function Show-ActiveListeners {
         }
     }
 
-    # Universal Netstat Fallback: Executes if cmdlets returned nothing or threw errors
     if ($resultsFound -eq 0) {
-        # Netstat TCP Listeners
         cmd.exe /c "netstat -ano -p tcp" | Select-String "LISTENING" | ForEach-Object {
             $line = $_.Line.Trim()
             if ($line -match "^\s*TCP\s+(\S+)\s+\S+\s+LISTENING\s+(\d+)") {
                 $endpoint = $matches[1]
                 $pidNum   = [int]$matches[2]
                 $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-                
                 Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "TCP", $endpoint, $pidNum, $pName) -ForegroundColor $(if ($endpoint -match ":22$|:4444$|:3389$") { "Red" } else { "White" })
             }
         }
 
-        # Netstat UDP Endpoints
         cmd.exe /c "netstat -ano -p udp" | ForEach-Object {
             $line = $_.Trim()
             if ($line -match "^\s*UDP\s+(\S+)\s+\*:\*\s+(\d+)") {
                 $endpoint = $matches[1]
                 $pidNum   = [int]$matches[2]
                 $pName    = if ($procTable.ContainsKey($pidNum)) { $procTable[$pidNum] } else { "UNKNOWN / RESTRICTED" }
-                
                 Write-Host ("{0,-6} {1,-32} {2,-10} {3}" -f "UDP", $endpoint, $pidNum, $pName) -ForegroundColor White
             }
         }
@@ -167,6 +161,47 @@ function Show-CoreServices {
     }
 }
 
+function Show-ThirdPartyServices {
+    Write-Host "`n=================================================================" -ForegroundColor Cyan
+    Write-Host "          THIRD-PARTY / NON-DEFAULT INSTALLED SERVICES           " -ForegroundColor Cyan
+    Write-Host "=================================================================" -ForegroundColor Cyan
+    Write-Host "Identifies non-standard services, Red Team backdoors, and unquoted paths." -ForegroundColor Gray
+    Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "SERVICE NAME", "STATE", "STARTMODE", "PATHNAME") -ForegroundColor White
+    Write-Host ("{0,-22} {1,-10} {2,-10} {3}" -f "============", "=====", "=========", "========") -ForegroundColor Gray
+
+    # Enumerate all system services via CIM/WMI to pull exact executable paths
+    $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue
+
+    $foundNonDefault = 0
+    foreach ($s in $services) {
+        $path = $s.PathName
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+
+        # Filter out native Windows core paths: C:\Windows\system32, C:\Windows\SysWOW64, C:\Windows\WinSxS
+        $isWindowsCore = $path -match "^([A-Z]:\\Windows\\(system32|SysWOW64|WinSxS|servicing)\b|system32\\)"
+
+        if (-not $isWindowsCore) {
+            $foundNonDefault++
+
+            # Check for Unquoted Service Path Vulnerability:
+            # Contains space in directory path, doesn't start with quote, and ends in .exe
+            $isUnquoted = ($path -notmatch '^"') -and ($path -match '\.exe(\s|$)') -and ($path -match ' ')
+
+            $color = "Yellow"
+            if ($s.Name -match "sshd|backdoor|nc|ncat|meterpreter" -or $isUnquoted) {
+                $color = "Red"
+            }
+
+            $unquotedTag = if ($isUnquoted) { " [!] UNQUOTED PATH VULN" } else { "" }
+            Write-Host ("{0,-22} {1,-10} {2,-10} {3}{4}" -f $s.Name, $s.State, $s.StartMode, $path, $unquotedTag) -ForegroundColor $color
+        }
+    }
+
+    if ($foundNonDefault -eq 0) {
+        Write-Host "No non-default third-party services detected." -ForegroundColor Green
+    }
+}
+
 function Show-InstalledAppsAndFeatures {
     Write-Host "`n=================================================================" -ForegroundColor Cyan
     Write-Host "               INSTALLED APPLICATIONS & FEATURES                 " -ForegroundColor Cyan
@@ -202,25 +237,28 @@ while ($true) {
     Write-Host "[1] Active Network Listeners (TCP & UDP with PID/Process)" -ForegroundColor Yellow
     Write-Host "[2] System & Network Configuration (IP, Gateway, DNS, MAC)"
     Write-Host "[3] Local & Domain Accounts / Privileged Groups"
-    Write-Host "[4] Core Active Directory & Domain Services Status"
-    Write-Host "[5] Installed Applications & Enabled Windows Features"
+    Write-Host "[4] Core Active Directory & Infrastructure Services Status"
+    Write-Host "[5] Third-Party & Non-Default Services (Unquoted Paths)" -ForegroundColor Yellow
+    Write-Host "[6] Installed Applications & Enabled Windows Features"
     Write-Host "[A] Run FULL Inventory (All Modules - for Copy-Pasting)" -ForegroundColor Green
     Write-Host "[Q] Quit" -ForegroundColor Red
     Write-Host "--------------------------------------------------------"
     
-    $choice = Read-Host "Select an option [1-5, A, Q]"
+    $choice = Read-Host "Select an option [1-6, A, Q]"
 
     switch ($choice.ToUpper()) {
         "1" { Show-ActiveListeners }
         "2" { Show-SystemNetworkConfig }
         "3" { Show-UsersAndGroups }
         "4" { Show-CoreServices }
-        "5" { Show-InstalledAppsAndFeatures }
+        "5" { Show-ThirdPartyServices }
+        "6" { Show-InstalledAppsAndFeatures }
         "A" {
             Show-SystemNetworkConfig
             Show-ActiveListeners
             Show-UsersAndGroups
             Show-CoreServices
+            Show-ThirdPartyServices
             Show-InstalledAppsAndFeatures
             Write-Host "`n=================================================================" -ForegroundColor Green
             Write-Host "                   FULL BASELINE COMPLETED                       " -ForegroundColor Green
@@ -231,7 +269,7 @@ while ($true) {
             return
         }
         Default {
-            Write-Host "`n[!] Invalid selection. Please enter 1, 2, 3, 4, 5, A, or Q." -ForegroundColor Red
+            Write-Host "`n[!] Invalid selection. Please enter 1-6, A, or Q." -ForegroundColor Red
         }
     }
 }
