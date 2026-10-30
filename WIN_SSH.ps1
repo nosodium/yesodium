@@ -17,10 +17,6 @@ if ($osInfo.ProductType -eq 2) {
     Write-Log "Notice: Host is running as Member Server/Standalone (ProductType: $($osInfo.ProductType))." "Yellow"
 }
 
-# Dynamically resolve Domain NetBIOS name for user/group matching
-$domainNetBIOS = $env:USERDOMAIN
-Write-Log "Active Directory Domain detected: $domainNetBIOS" "Green"
-
 # 2. Install OpenSSH
 if ($build -ge 17763) {
     # =========================================================================
@@ -53,7 +49,7 @@ if ($build -ge 17763) {
     $zipPath = "$env:TEMP\OpenSSH-Win64.zip"
     $downloadUrl = "https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip"
 
-    Write-Log "Downloading latest Win32-OpenSSH release..."
+    Write-Log "Downloading latest release..."
     (New-Object System.Net.WebClient).DownloadFile($downloadUrl, $zipPath)
 
     Write-Log "Extracting binaries..."
@@ -81,69 +77,14 @@ if ($build -ge 17763) {
     powershell.exe -ExecutionPolicy Bypass -File "$installDir\install-sshd.ps1"
 }
 
-# 3. Configure Services & Initial Start (generates host keys & default config)
-Write-Log "Configuring sshd service..."
+# 3. Configure Services & Initial Start
+Write-Log "Configuring and starting sshd service..."
 Set-Service -Name "sshd" -StartupType Automatic
 Start-Service -Name "sshd"
 
 # 4. Open Firewall Port 22
-Write-Log "Configuring Windows Firewall rules for Port 22..."
+Write-Log "Adding Port 22 to Windows Firewall..."
 & netsh advfirewall firewall delete rule name="OpenSSH-Server (TCP-In)" protocol=TCP localport=22 | Out-Null
 & netsh advfirewall firewall add rule name="OpenSSH-Server (TCP-In)" dir=in action=allow protocol=TCP localport=22 profile=any
 
-# 5. Apply Hardening & Restrict to Domain Admins
-Write-Log "Configuring sshd_config hardening & access controls..."
-$configPath = "$env:ProgramData\ssh\sshd_config"
-
-# Wait briefly for sshd to finish creating initial files on first start
-Start-Sleep -Seconds 2
-
-if (Test-Path $configPath) {
-    $content = Get-Content $configPath
-
-    # --- Authentication Mode ---
-    $content = $content -replace '#?PasswordAuthentication\s+(yes|no)', 'PasswordAuthentication yes'
-    $content = $content -replace '#?KbdInteractiveAuthentication\s+(yes|no)', 'KbdInteractiveAuthentication yes'
-    $content = $content -replace '#?PubkeyAuthentication\s+(yes|no)', 'PubkeyAuthentication no'
-
-    # Comment out default administrator authorized_keys override block
-    $joined = $content -join "`n"
-    $joined = $joined -replace 'Match Group administrators', '#Match Group administrators'
-    $joined = $joined -replace 'AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys', '#AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys'
-
-    # --- Hardening & Session Restrictions ---
-    # Strip any previously written custom configuration blocks
-    $joined = $joined -replace '(?ms)# === DC HARDENING START ===.*?# === DC HARDENING END ===', ''
-
-    $hardeningBlock = @"
-
-# === DC HARDENING START ===
-# 1. Access Control: Only allow the Domain Administrator and Domain Admins group
-# (In OpenSSH, space in group names can be written with quotes or '?' wildcard)
-AllowUsers $domainNetBIOS\administrator
-
-# 2. Session & Channel Limits
-MaxSessions 2                # Max open shell/subsystem channels per SSH connection
-MaxAuthTries 3               # Disconnect after 3 failed password attempts (anti-brute-force)
-
-# 3. Connection Rate-Limiting (Anti-DoS)
-# Starts dropping unauthenticated connections at 10, drops 30% linearly, caps at 60
-MaxStartups 10:30:60
-
-# 4. Inactivity & Keepalive Timeouts
-# Terminate idle sessions after ~10 minutes (300s x 2 checks)
-ClientAliveInterval 300
-ClientAliveCountMax 2
-
-# 5. Security Hygiene
-LoginGraceTime 30            # Drop unauthenticated sessions lingering for > 30s
-PrintLastLog yes
-# === DC HARDENING END ===
-"@
-
-    $finalConfig = $joined.Trim() + "`n" + $hardeningBlock
-    Set-Content -Path $configPath -Value $finalConfig -Encoding utf8
-}
-
-Restart-Service -Name "sshd"
-Write-Log "Setup complete! OpenSSH is locked down to Domain Admins only." "Green"
+Write-Log "Setup complete! OpenSSH is installed and running with default configuration." "Green"
