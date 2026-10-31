@@ -1,10 +1,9 @@
 <#
 .SYNOPSIS
-    CCDC Master Blue Team Deployment & Orchestration Engine
+    CCDC Master Blue Team Deployment & Orchestration Engine (v2)
 .DESCRIPTION
-    Compatible across Windows Server 2012 through 2025. Pure ASCII.
-    Downloads all 8 repository scripts, backs them up locally,
-    and provides a priority-ordered execution menu.
+    Smart local caching. Only downloads on first run or when [R] is pressed.
+    Creates C:\menu.bat for instant re-opening. Pure ASCII.
 #>
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -19,13 +18,6 @@ $BackupDir  = "C:\CCDC\Scripts\Backup"
 if (-not (Test-Path $ScriptsDir)) { New-Item -ItemType Directory -Path $ScriptsDir -Force | Out-Null }
 if (-not (Test-Path $BackupDir))  { New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null }
 
-Write-Output "================================================================="
-Write-Output "          CCDC MASTER BLUE TEAM SCRIPT ORCHESTRATOR              "
-Write-Output "================================================================="
-Write-Output ("[*] Primary Directory : " + $ScriptsDir)
-Write-Output ("[*] Backup Directory  : " + $BackupDir)
-
-# 3. Target Script Manifest
 $BaseUrl = "https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main"
 $ScriptList = @(
     "inv.ps1",
@@ -33,13 +25,14 @@ $ScriptList = @(
     "fw.ps1",
     "harden.ps1",
     "secpol.ps1",
+    "auditpost.ps1",
+    "deps.ps1",
     "tools.ps1",
-    "thrunt.ps1",
-    "auditpost.ps1"
+    "thrunt.ps1"
 )
 
 function Sync-ScriptsFromGitHub {
-    Write-Output "`n[*] Downloading latest scripts from GitHub..."
+    Write-Output "`n[*] Synchronizing scripts from GitHub repository..."
     $webClient = New-Object System.Net.WebClient
 
     foreach ($scriptName in $ScriptList) {
@@ -52,21 +45,30 @@ function Sync-ScriptsFromGitHub {
             $webClient.DownloadFile($sourceUrl, $destPath)
             
             if (Test-Path $destPath) {
-                # Create duplicate safety backup
                 Copy-Item -Path $destPath -Destination $bakPath -Force | Out-Null
                 Write-Output ("      -> [OK] Saved & Backed up.")
             } else {
-                Write-Output ("      -> [FAIL] File not found on disk.")
+                Write-Output ("      -> [FAIL] File missing on disk.")
             }
         } catch {
             Write-Output ("      -> [FAIL] " + $_.Exception.Message)
         }
     }
-    Write-Output "[+] Script synchronization pass completed."
+
+    # Create quick shortcut C:\menu.bat
+    "@echo off`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"C:\CCDC\Scripts\setup.ps1`"" | Out-File -FilePath "C:\menu.bat" -Encoding ASCII -Force
+    Write-Output "[+] Script synchronization complete. Shortcut created at C:\menu.bat"
 }
 
-# Run initial download on launch
-Sync-ScriptsFromGitHub
+# 3. Smart Cache Check (Skip downloading if files already exist)
+$existingFiles = Get-ChildItem -Path $ScriptsDir -Filter "*.ps1" -ErrorAction SilentlyContinue
+if (-not $existingFiles -or $existingFiles.Count -lt $ScriptList.Count) {
+    Write-Output "[*] First-time setup detected. Downloading all scripts from repository..."
+    Sync-ScriptsFromGitHub
+} else {
+    Write-Output "[+] All scripts already verified in $ScriptsDir."
+    Write-Output "[*] Skipping download. Press [R] in the menu if you need to force re-download."
+}
 
 # ====================================================================
 # PRIORITY EXECUTION MENU
@@ -82,57 +84,28 @@ while ($true) {
     Write-Output "[4] PRIORITY 4: AD & Exploit Hardening      (harden.ps1)"
     Write-Output "[5] PRIORITY 5: Host Policies & Telemetry   (secpol.ps1)"
     Write-Output "[6] PRIORITY 6: Post-Hardening Verification (auditpost.ps1)"
+    Write-Output "[7] PRIORITY 7: Service Accounts & SSO Map  (deps.ps1)"
     Write-Output "--------------------------------------------------------"
-    Write-Output "[7] UTILITY: Download Sysinternals Suite    (tools.ps1)"
-    Write-Output "[8] UTILITY: Threat Hunting Engine          (thrunt.ps1)"
-    Write-Output "[R] RE-SYNC: Refresh All Scripts from GitHub"
+    Write-Output "[8] UTILITY: Download Sysinternals Suite    (tools.ps1)"
+    Write-Output "[9] UTILITY: Threat Hunting Engine          (thrunt.ps1)"
+    Write-Output "[R] RE-SYNC: Force Refresh All Scripts from GitHub"
     Write-Output "[Q] QUIT"
     Write-Output "--------------------------------------------------------"
 
-    $choice = Read-Host "Select a priority phase to execute [1-8, R, Q]"
+    $choice = Read-Host "Select a priority phase to execute [1-9, R, Q]"
 
     switch ($choice.ToUpper()) {
-        "1" {
-            if (Test-Path "$ScriptsDir\inv.ps1") { & "$ScriptsDir\inv.ps1" }
-            else { Write-Output "[-] Script inv.ps1 missing." }
-        }
-        "2" {
-            if (Test-Path "$ScriptsDir\pw.ps1") { & "$ScriptsDir\pw.ps1" }
-            else { Write-Output "[-] Script pw.ps1 missing." }
-        }
-        "3" {
-            if (Test-Path "$ScriptsDir\fw.ps1") { & "$ScriptsDir\fw.ps1" }
-            else { Write-Output "[-] Script fw.ps1 missing." }
-        }
-        "4" {
-            if (Test-Path "$ScriptsDir\harden.ps1") { & "$ScriptsDir\harden.ps1" }
-            else { Write-Output "[-] Script harden.ps1 missing." }
-        }
-        "5" {
-            if (Test-Path "$ScriptsDir\secpol.ps1") { & "$ScriptsDir\secpol.ps1" }
-            else { Write-Output "[-] Script secpol.ps1 missing." }
-        }
-        "6" {
-            if (Test-Path "$ScriptsDir\auditpost.ps1") { & "$ScriptsDir\auditpost.ps1" }
-            else { Write-Output "[-] Script auditpost.ps1 missing." }
-        }
-        "7" {
-            if (Test-Path "$ScriptsDir\tools.ps1") { & "$ScriptsDir\tools.ps1" }
-            else { Write-Output "[-] Script tools.ps1 missing." }
-        }
-        "8" {
-            if (Test-Path "$ScriptsDir\thrunt.ps1") { & "$ScriptsDir\thrunt.ps1" }
-            else { Write-Output "[-] Script thrunt.ps1 missing." }
-        }
-        "R" {
-            Sync-ScriptsFromGitHub
-        }
-        "Q" {
-            Write-Output "Exiting Master Orchestrator."
-            return
-        }
-        Default {
-            Write-Output "[!] Invalid selection. Please enter 1-8, R, or Q."
-        }
+        "1" { if (Test-Path "$ScriptsDir\inv.ps1") { & "$ScriptsDir\inv.ps1" } }
+        "2" { if (Test-Path "$ScriptsDir\pw.ps1") { & "$ScriptsDir\pw.ps1" } }
+        "3" { if (Test-Path "$ScriptsDir\fw.ps1") { & "$ScriptsDir\fw.ps1" } }
+        "4" { if (Test-Path "$ScriptsDir\harden.ps1") { & "$ScriptsDir\harden.ps1" } }
+        "5" { if (Test-Path "$ScriptsDir\secpol.ps1") { & "$ScriptsDir\secpol.ps1" } }
+        "6" { if (Test-Path "$ScriptsDir\auditpost.ps1") { & "$ScriptsDir\auditpost.ps1" } }
+        "7" { if (Test-Path "$ScriptsDir\deps.ps1") { & "$ScriptsDir\deps.ps1" } }
+        "8" { if (Test-Path "$ScriptsDir\tools.ps1") { & "$ScriptsDir\tools.ps1" } }
+        "9" { if (Test-Path "$ScriptsDir\thrunt.ps1") { & "$ScriptsDir\thrunt.ps1" } }
+        "R" { Sync-ScriptsFromGitHub }
+        "Q" { Write-Output "Exiting menu. To reopen anytime, run: C:\menu.bat or & C:\CCDC\Scripts\setup.ps1"; return }
+        Default { Write-Output "[!] Invalid selection. Please enter 1-9, R, or Q." }
     }
 }
