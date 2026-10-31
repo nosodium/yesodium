@@ -3,6 +3,10 @@ Setup:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; $u='https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main/setup.ps1?nocache='+(Get-Random); (New-Object System.Net.WebClient).DownloadFile($u, \"$env:TEMP\setup.ps1\"); & \"$env:TEMP\setup.ps1\""
 ```
 
+```shell
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main/setup.ps1?v=' + (Get-Random), "$env:TEMP\setup.ps1"); & "$env:TEMP\setup.ps1"
+```
+
 SSH PS Script CMD Prompt:
 ```shell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; iex ((New-Object System.Net.WebClient).DownloadString('https://raw.githubusercontent.com/nosodium/yesodium/refs/heads/main/WIN_SSH.ps1'))"
