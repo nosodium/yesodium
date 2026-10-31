@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    CCDC Universal Domain Controller Firewall Engine (Inbound Block / Outbound Block + Mirrored Rules)
+    CCDC Universal Domain Controller Firewall Engine (v4 - Friendly Service Names)
 .DESCRIPTION
     Compatible across Windows Server 2012 through 2025. Pure ASCII.
     - Displays current profile states (Domain, Private, Public)
@@ -8,6 +8,7 @@
     - Disables all non-essential / pre-existing inbound AND outbound rules (kills C2 beacons)
     - Injects mirrored Inbound (localport) and Outbound (remoteport) Active Directory rules
     - Provides interactive custom rule opener that automatically mirrors outbound
+    - Clean tabular output with human-readable SERVICE / ROLE descriptions
     - Full atomic backup and restore via .wfw snapshots
 #>
 
@@ -18,6 +19,43 @@ $HardenedBackupFile = "$BackupDir\Hardened_Firewall.wfw"
 
 if (-not (Test-Path $BackupDir)) {
     New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+}
+
+function Get-PortServiceDescription {
+    param([string]$Port, [string]$RuleName)
+    
+    $portMap = @{
+        "53"          = "DNS (Domain Name System)"
+        "88"          = "Kerberos Authentication"
+        "123"         = "Windows Time (NTP)"
+        "135"         = "RPC Endpoint Mapper"
+        "389"         = "LDAP Directory Service"
+        "445"         = "SMB / AD SYSVOL & File Shares"
+        "464"         = "Kerberos Password Change (kpasswd)"
+        "636"         = "LDAPS (Secure LDAP)"
+        "3268"        = "Active Directory Global Catalog"
+        "3269"        = "Active Directory Global Catalog SSL"
+        "3389"        = "RDP (Remote Desktop Management)"
+        "5985"        = "WinRM (PowerShell Remoting HTTP)"
+        "5986"        = "WinRM (PowerShell Remoting HTTPS)"
+        "49152-65535" = "RPC Dynamic High Ports (AD Replication)"
+        "80"          = "HTTP (Web Service)"
+        "443"         = "HTTPS (Secure Web Service)"
+        "80,443"      = "Web Browsing / GitHub (HTTP & HTTPS)"
+        "1433"        = "Microsoft SQL Server"
+        "3306"        = "MySQL Database"
+    }
+
+    if ($portMap.ContainsKey($Port)) {
+        return $portMap[$Port]
+    }
+
+    # Extract name from custom rule format (e.g., CCDC_Custom_Keycloak_In -> Keycloak)
+    if ($RuleName -match "CCDC_Custom_(.*)_(In|Out)") {
+        return "Custom Service (" + $matches[1] + ")"
+    }
+
+    return "Custom Port ($Port)"
 }
 
 function Show-FirewallProfileStatus {
@@ -70,7 +108,7 @@ function Add-CustomRule {
     Write-Output "`n================================================================="
     Write-Output "               ADD CUSTOM FIREWALL RULE                          "
     Write-Output "================================================================="
-    $rName = Read-Host "Enter rule name (e.g. ScoredWebService)"
+    $rName = Read-Host "Enter rule name (e.g. Keycloak or WebService)"
     if ([string]::IsNullOrWhiteSpace($rName)) {
         Write-Output "[-] Rule name cannot be empty."
         return
@@ -119,11 +157,9 @@ function Invoke-HardeningSequence {
     cmd.exe /c "netsh advfirewall set allprofiles state on" 2>$null | Out-Null
 
     Write-Output "[*] [2/6] Enforcing Strict Default Policies: Inbound = BLOCK, Outbound = BLOCK..."
-    # Sets BOTH inbound and outbound to Block by default
     cmd.exe /c "netsh advfirewall set allprofiles firewallpolicy blockinbound,blockoutbound" 2>$null | Out-Null
 
     Write-Output "[*] [3/6] Disabling all pre-existing Inbound and Outbound rules..."
-    # Disables all rules so rogue open ports, reverse shells, and C2 beacons are neutralized
     cmd.exe /c "netsh advfirewall firewall set rule name=all dir=in new enable=no" 2>$null | Out-Null
     cmd.exe /c "netsh advfirewall firewall set rule name=all dir=out new enable=no" 2>$null | Out-Null
     Write-Output "  [+] All pre-existing inbound and outbound rules disabled."
@@ -150,29 +186,30 @@ function Invoke-HardeningSequence {
 
     foreach ($r in $adRules) {
         $inName = $r.Name + "_In"
+        $desc = Get-PortServiceDescription -Port $r.Port -RuleName $inName
         cmd.exe /c "netsh advfirewall firewall delete rule name=`"$inName`"" 2>$null | Out-Null
         cmd.exe /c "netsh advfirewall firewall add rule name=`"$inName`" dir=in action=allow protocol=$($r.Proto) localport=$($r.Port) enable=yes profile=any" 2>$null | Out-Null
-        Write-Output ("  [+] Inbound Allowed  : " + $inName.PadRight(35) + " (" + $r.Proto + " LocalPort: " + $r.Port + ")")
+        Write-Output ("  [+] Inbound Allowed  : " + $inName.PadRight(35) + " (" + $r.Proto + " Port: " + $r.Port + " - " + $desc + ")")
     }
 
     Write-Output "`n[*] [5/6] Injecting Mirrored Outbound Rules (remoteport) for AD Operation..."
     foreach ($r in $adRules) {
         $outName = $r.Name + "_Out"
+        $desc = Get-PortServiceDescription -Port $r.Port -RuleName $outName
         cmd.exe /c "netsh advfirewall firewall delete rule name=`"$outName`"" 2>$null | Out-Null
         cmd.exe /c "netsh advfirewall firewall add rule name=`"$outName`" dir=out action=allow protocol=$($r.Proto) remoteport=$($r.Port) enable=yes profile=any" 2>$null | Out-Null
-        Write-Output ("  [+] Outbound Allowed : " + $outName.PadRight(35) + " (" + $r.Proto + " RemotePort: " + $r.Port + ")")
+        Write-Output ("  [+] Outbound Allowed : " + $outName.PadRight(35) + " (" + $r.Proto + " Port: " + $r.Port + " - " + $desc + ")")
     }
 
-    # Optional RDP / WinRM injection (Mirrored)
     if ($allowRDP -ne 'N' -and $allowRDP -ne 'n') {
         cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_RDP_In`" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any" 2>$null | Out-Null
         cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_RDP_Out`" dir=out action=allow protocol=TCP remoteport=3389 enable=yes profile=any" 2>$null | Out-Null
-        Write-Output "  [+] Management Allowed : CCDC_Mgmt_RDP (Inbound & Outbound TCP 3389)"
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_RDP (In & Out TCP 3389 - Remote Desktop)"
     }
     if ($allowWinRM -eq 'Y' -or $allowWinRM -eq 'y') {
         cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_WinRM_In`" dir=in action=allow protocol=TCP localport=5985 enable=yes profile=any" 2>$null | Out-Null
         cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_WinRM_Out`" dir=out action=allow protocol=TCP remoteport=5985 enable=yes profile=any" 2>$null | Out-Null
-        Write-Output "  [+] Management Allowed : CCDC_Mgmt_WinRM (Inbound & Outbound TCP 5985)"
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_WinRM (In & Out TCP 5985 - WinRM Remoting)"
     }
 
     Write-Output "`n[*] [6/6] Creating Hardened Baseline Backup..."
@@ -187,18 +224,94 @@ function Invoke-HardeningSequence {
 }
 
 function Show-ActiveRules {
-    Write-Output "`n================================================================="
-    Write-Output "               ACTIVE CCDC ALLOW RULES (IN & OUT)                "
-    Write-Output "================================================================="
-    cmd.exe /c "netsh advfirewall firewall show rule name=all" 2>$null | Select-String -Pattern "Rule Name:|Enabled:|Direction:|LocalPort:|RemotePort:" | ForEach-Object {
-        $line = $_.Line.Trim()
-        if ($line -match "Rule Name:\s*(CCDC_.*)") {
-            Write-Output "`n-----------------------------------------"
-            Write-Output $line
-        } elseif ($line -match "Enabled:\s*Yes" -or $line -match "Direction:" -or $line -match "LocalPort:" -or $line -match "RemotePort:") {
-            Write-Output ("  " + $line)
+    Write-Output "`n========================================================================================================================"
+    Write-Output "                                           ACTIVE CCDC FIREWALL ALLOW RULES                                             "
+    Write-Output "========================================================================================================================"
+
+    $rules = @()
+
+    # Method 1: PowerShell NetSecurity Module
+    if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
+        $netRules = Get-NetFirewallRule -DisplayName "CCDC_*" -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' }
+        foreach ($nr in $netRules) {
+            $pf = $nr | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+            $dir = $nr.Direction.ToString().ToUpper()
+            $proto = if ($pf.Protocol) { $pf.Protocol.ToString().ToUpper() } else { "ANY" }
+            $port = if ($dir -eq "INBOUND") { $pf.LocalPort } else { $pf.RemotePort }
+            if ([string]::IsNullOrWhiteSpace($port)) { $port = "Any" }
+
+            $rules += New-Object PSObject -Property @{
+                Name        = $nr.DisplayName
+                Direction   = $dir
+                Protocol    = $proto
+                Port        = $port
+                Description = (Get-PortServiceDescription -Port $port -RuleName $nr.DisplayName)
+            }
         }
     }
+
+    # Method 2: Block Parser Fallback for Netsh
+    if ($rules.Count -eq 0) {
+        $rawOutput = cmd.exe /c "netsh advfirewall firewall show rule name=all" 2>$null
+        $cur = $null
+
+        foreach ($line in $rawOutput) {
+            $t = $line.Trim()
+            if ($t -match "^Rule Name:\s*(CCDC_.*)") {
+                if ($cur -and $cur.Enabled -eq "Yes") { 
+                    $rules += New-Object PSObject -Property $cur 
+                }
+                $cur = @{ Name = $matches[1]; Enabled = ""; Direction = ""; Protocol = ""; Port = ""; Description = "" }
+            } elseif ($cur) {
+                if ($t -match "^Rule Name:") {
+                    if ($cur.Enabled -eq "Yes") { $rules += New-Object PSObject -Property $cur }
+                    $cur = $null
+                } elseif ($t -match "^Enabled:\s*(.+)") {
+                    $cur.Enabled = $matches[1]
+                } elseif ($t -match "^Direction:\s*(.+)") {
+                    $cur.Direction = if ($matches[1] -match "In") { "INBOUND" } else { "OUTBOUND" }
+                } elseif ($t -match "^Protocol:\s*(.+)") {
+                    $cur.Protocol = $matches[1].ToUpper()
+                } elseif ($t -match "^LocalPort:\s*(.+)" -and $cur.Direction -eq "INBOUND") {
+                    $cur.Port = $matches[1]
+                    $cur.Description = Get-PortServiceDescription -Port $matches[1] -RuleName $cur.Name
+                } elseif ($t -match "^RemotePort:\s*(.+)" -and $cur.Direction -eq "OUTBOUND") {
+                    $cur.Port = $matches[1]
+                    $cur.Description = Get-PortServiceDescription -Port $matches[1] -RuleName $cur.Name
+                }
+            }
+        }
+        if ($cur -and $cur.Enabled -eq "Yes") { 
+            $rules += New-Object PSObject -Property $cur 
+        }
+    }
+
+    # Table 1: Inbound Rules
+    Write-Output "`n[+] INBOUND ALLOWED RULES (LOCAL PORTS LISTENING)"
+    Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f "PROTO", "PORT", "SERVICE / ROLE", "RULE NAME")
+    Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f "-----", "----", "--------------", "---------")
+    $inRules = $rules | Where-Object { $_.Direction -eq "INBOUND" } | Sort-Object Protocol, Port
+    if ($inRules) {
+        foreach ($r in $inRules) {
+            Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f $r.Protocol, $r.Port, $r.Description, $r.Name)
+        }
+    } else {
+        Write-Output "No active CCDC inbound allow rules."
+    }
+
+    # Table 2: Outbound Rules
+    Write-Output "`n[+] OUTBOUND ALLOWED RULES (REMOTE DESTINATION PORTS)"
+    Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f "PROTO", "PORT", "SERVICE / ROLE", "RULE NAME")
+    Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f "-----", "----", "--------------", "---------")
+    $outRules = $rules | Where-Object { $_.Direction -eq "OUTBOUND" } | Sort-Object Protocol, Port
+    if ($outRules) {
+        foreach ($r in $outRules) {
+            Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f $r.Protocol, $r.Port, $r.Description, $r.Name)
+        }
+    } else {
+        Write-Output "No active CCDC outbound allow rules."
+    }
+    Write-Output "`n========================================================================================================================"
 }
 
 # ====================================================================
