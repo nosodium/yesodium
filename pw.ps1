@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Automated Credential Rotation Script
-.PARAMETER TargetUser
-    Optional. Specify a single username to target instead of rotating all accounts.
-.PARAMETER TargetType
-    Optional. Must be "Local" or "Domain" when specifying TargetUser.
+    Automated Credential Rotation Script with Interactive Two-Way Paginated Output
+.DESCRIPTION
+    Generates strong, randomized passphrase-style credentials:
+    [Adjective]-[Color]-[Noun][Number][Special] (e.g., Sneaky-Black-Zebra42!)
+    Displays credentials with Previous/Next paging controls for screenshots.
 #>
 
 [CmdletBinding()]
@@ -83,7 +83,6 @@ function Set-AccountPassword {
             [Console]::WriteLine("[+] Domain user '$Username' rotated successfully.")
         }
 
-        # Append CSV line: Username,Password
         $OutputList.Value += "$Username,$newPlainPassword"
     } catch {
         [Console]::WriteLine("[-] Error changing password for $Username ($Type): " + $_.Exception.Message)
@@ -91,8 +90,9 @@ function Set-AccountPassword {
 }
 
 # ==========================================
-# 3. INITIALIZATION & EXECUTION
+# 3. ROTATION EXECUTION
 # ==========================================
+Clear-Host
 [Console]::WriteLine("=================================================================")
 [Console]::WriteLine("             AUTOMATED CREDENTIAL ROTATION SYSTEM                ")
 [Console]::WriteLine("=================================================================")
@@ -133,12 +133,10 @@ else {
             [Console]::WriteLine("`n[*] Enumerating & rotating Active Directory Domain Users...")
             $allDomainUsers = @()
 
-            # Primary: Active Directory Module
             if (Get-Command Get-ADUser -ErrorAction SilentlyContinue) {
                 $allDomainUsers = Get-ADUser -Filter * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SamAccountName
             }
 
-            # Fallback: ADSI LDAP
             if (-not $allDomainUsers -or $allDomainUsers.Count -eq 0) {
                 try {
                     $rootDSE = [ADSI]"LDAP://RootDSE"
@@ -156,38 +154,71 @@ else {
 
             if ($allDomainUsers.Count -gt 0) {
                 foreach ($dUser in ($allDomainUsers | Sort-Object -Unique)) {
-                    # Skip machine accounts
                     if ($dUser.EndsWith("$")) { continue }
-
                     Set-AccountPassword -Username $dUser -Type "Domain" -OutputList ([ref]$credentialOutput)
                 }
             } else {
-                [Console]::WriteLine("[-] No domain users found or unable to query domain controller.")
+                [Console]::WriteLine("[-] No domain users found or unable to contact domain controller.")
             }
         }
     }
 }
 
 # ==========================================
-# 4. EXPORT CREDENTIALS TO FILE
+# 4. TWO-WAY PAGINATED VIEWER
 # ==========================================
 if ($credentialOutput.Count -gt 0) {
-    # Windows paths cannot contain ':'. Using 'h.mmtt' produces 'PCR_9.30AM.txt'
-    $timestamp = (Get-Date).ToString("h.mmtt")
-    $fileName = "PCR_$timestamp.txt"
-    $fullPath = Join-Path -Path $PSScriptRoot -ChildPath $fileName
+    $pageSize = 20
+    $totalCount = $credentialOutput.Count
+    $totalPages = [Math]::Ceiling($totalCount / $pageSize)
+    $currentPage = 0
 
-    # Fallback to current working directory if $PSScriptRoot is empty (e.g. running in ISE/interactive prompt)
-    if (-not $PSScriptRoot) {
-        $fullPath = Join-Path -Path (Get-Location).Path -ChildPath $fileName
+    while ($true) {
+        Clear-Host
+        $startIdx = $currentPage * $pageSize
+        $endIdx = [Math]::Min($startIdx + $pageSize - 1, $totalCount - 1)
+        $displayPage = $currentPage + 1
+
+        Write-Host "================================================================================" -ForegroundColor Cyan
+        Write-Host " PASSWORD ROTATION REPORT  |  Page $displayPage of $totalPages  |  Total Users: $totalCount" -ForegroundColor Cyan
+        Write-Host "================================================================================" -ForegroundColor Cyan
+        Write-Host ""
+
+        for ($i = $startIdx; $i -le $endIdx; $i++) {
+            Write-Host $credentialOutput[$i]
+        }
+
+        Write-Host ""
+        Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
+        
+        # Build intuitive prompt bar
+        $navControls = @()
+        if ($currentPage -lt ($totalPages - 1)) { $navControls += "[Right Arrow / N] Next" }
+        if ($currentPage -gt 0)                { $navControls += "[Left Arrow / P] Previous" }
+        $navControls += "[Q] Quit"
+
+        Write-Host ($navControls -join "  |  ") -ForegroundColor Yellow
+
+        # Read key press (does not echo to terminal)
+        $key = [Console]::ReadKey($true)
+
+        # Navigation conditions
+        if ($key.Key -eq [ConsoleKey]::RightArrow -or $key.Key -eq [ConsoleKey]::N -or $key.Key -eq [ConsoleKey]::Enter -or $key.Key -eq [ConsoleKey]::Spacebar) {
+            if ($currentPage -lt ($totalPages - 1)) {
+                $currentPage++
+            }
+        }
+        elseif ($key.Key -eq [ConsoleKey]::LeftArrow -or $key.Key -eq [ConsoleKey]::P -or $key.Key -eq [ConsoleKey]::B) {
+            if ($currentPage -gt 0) {
+                $currentPage--
+            }
+        }
+        elseif ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
+            Clear-Host
+            Write-Host "[+] Exited report viewer." -ForegroundColor Green
+            break
+        }
     }
-
-    $credentialOutput | Out-File -FilePath $fullPath -Encoding utf8
-
-    [Console]::WriteLine("`n=================================================================")
-    [Console]::WriteLine("[+] Rotation finished. Credentials saved to:")
-    [Console]::WriteLine("    $fullPath")
-    [Console]::WriteLine("=================================================================")
 } else {
-    [Console]::WriteLine("`n[!] No accounts were modified. No log file created.")
+    Write-Host "`n[!] No accounts were modified." -ForegroundColor Red
 }
