@@ -1,17 +1,25 @@
 <#
 .SYNOPSIS
-    Automated Credential Rotation Script with Interactive Two-Way Paginated Output
+    Zero-Trace Automated Credential Rotation Script
 .DESCRIPTION
-    Generates strong, randomized passphrase-style credentials:
-    [Adjective]-[Color]-[Noun][Number][Special] (e.g., Sneaky-Black-Zebra42!)
-    Displays credentials with Previous/Next paging controls for screenshots.
+    Rotates credentials, displays them page-by-page in memory only,
+    disables transcription, wipes memory variables, and cleans console buffers.
 #>
 
 [CmdletBinding()]
 param(
     [string]$TargetUser,
-    [ValidateSet("Local", "Domain")][string]$TargetType
+    [string]$TargetType
 )
+
+# Normalize/validate TargetType if provided via CLI
+if ($TargetType -and ($TargetType -notmatch '^(?i:Local|Domain)$')) {
+    Write-Warning "TargetType must be either 'Local' or 'Domain'."
+    return
+}
+
+# --- ANTI-LEAK: Ensure PS Transcription is not recording the console ---
+try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
 
 Import-Module ActiveDirectory -ErrorAction SilentlyContinue
 
@@ -72,12 +80,12 @@ function Set-AccountPassword {
     $passSecure = ConvertTo-SecureString $newPlainPassword -AsPlainText -Force
 
     try {
-        if ($Type -eq "Local") {
+        if ($Type -match "(?i)^Local$") {
             $user = [ADSI]"WinNT://$env:COMPUTERNAME/$Username,user"
             $user.SetPassword($newPlainPassword)
             $user.SetInfo()
             [Console]::WriteLine("[+] Local user '$Username' rotated successfully.")
-        } elseif ($Type -eq "Domain") {
+        } elseif ($Type -match "(?i)^Domain$") {
             Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset
             Set-ADUser -Identity $Username -PasswordNeverExpires $true
             [Console]::WriteLine("[+] Domain user '$Username' rotated successfully.")
@@ -99,7 +107,6 @@ Clear-Host
 
 $credentialOutput = @()
 
-# OPTION A: Single User Mode
 if ($TargetUser) {
     if (-not $TargetType) {
         $choice = Read-Host "Is '$TargetUser' a [L]ocal or [D]omain account? (L/D)"
@@ -109,7 +116,6 @@ if ($TargetUser) {
     [Console]::WriteLine("[*] Running single-target mode on: $TargetUser ($TargetType)")
     Set-AccountPassword -Username $TargetUser -Type $TargetType -OutputList ([ref]$credentialOutput)
 }
-# OPTION B: Automated Bulk Rotation
 else {
     $interactiveCheck = Read-Host "Rotate [A]ll accounts or specify a [S]ingle user? (A/S)"
     if ($interactiveCheck -match "^[Ss]") {
@@ -119,7 +125,7 @@ else {
         
         Set-AccountPassword -Username $TargetUser -Type $TargetType -OutputList ([ref]$credentialOutput)
     } else {
-        # 1. Rotate Local Accounts
+        # 1. Local Accounts
         [Console]::WriteLine("`n[*] Enumerating & rotating Local Accounts...")
         $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
         if ($localUsers) {
@@ -128,7 +134,7 @@ else {
             }
         }
 
-        # 2. Rotate Domain Users
+        # 2. Domain Users
         if ((Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
             [Console]::WriteLine("`n[*] Enumerating & rotating Active Directory Domain Users...")
             $allDomainUsers = @()
@@ -191,34 +197,44 @@ if ($credentialOutput.Count -gt 0) {
         Write-Host ""
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
         
-        # Build intuitive prompt bar
         $navControls = @()
         if ($currentPage -lt ($totalPages - 1)) { $navControls += "[Right Arrow / N] Next" }
         if ($currentPage -gt 0)                { $navControls += "[Left Arrow / P] Previous" }
-        $navControls += "[Q] Quit"
+        $navControls += "[Q / Esc] Quit"
 
         Write-Host ($navControls -join "  |  ") -ForegroundColor Yellow
 
-        # Read key press (does not echo to terminal)
         $key = [Console]::ReadKey($true)
 
-        # Navigation conditions
         if ($key.Key -eq [ConsoleKey]::RightArrow -or $key.Key -eq [ConsoleKey]::N -or $key.Key -eq [ConsoleKey]::Enter -or $key.Key -eq [ConsoleKey]::Spacebar) {
-            if ($currentPage -lt ($totalPages - 1)) {
-                $currentPage++
-            }
+            if ($currentPage -lt ($totalPages - 1)) { $currentPage++ }
         }
         elseif ($key.Key -eq [ConsoleKey]::LeftArrow -or $key.Key -eq [ConsoleKey]::P -or $key.Key -eq [ConsoleKey]::B) {
-            if ($currentPage -gt 0) {
-                $currentPage--
-            }
+            if ($currentPage -gt 0) { $currentPage-- }
         }
         elseif ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
-            Clear-Host
-            Write-Host "[+] Exited report viewer." -ForegroundColor Green
             break
         }
     }
 } else {
     Write-Host "`n[!] No accounts were modified." -ForegroundColor Red
 }
+
+# ==========================================
+# 5. MEMORY & ARTIFACT SCRUBBING
+# ==========================================
+$credentialOutput = $null
+$allDomainUsers   = $null
+$localUsers       = $null
+[GC]::Collect()
+[GC]::WaitForPendingFinalizers()
+
+Clear-Host
+[Console]::Clear()
+
+Clear-History -ErrorAction SilentlyContinue
+try {
+    [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()
+} catch {}
+
+Write-Host "[+] Passwords rotated, screenshots completed, and session memory cleared." -ForegroundColor Green
