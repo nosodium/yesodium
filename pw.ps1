@@ -53,25 +53,27 @@ function Set-AccountPassword {
     param(
         [string]$Username,
         [string]$Type,
+        [string]$ExplicitPassword = $null,
         [ref]$OutputList
     )
 
-    $newPlainPassword = New-RandomPassword
-    $passSecure = ConvertTo-SecureString $newPlainPassword -AsPlainText -Force
+    # Use explicit password if provided, otherwise auto-generate
+    $plainPassword = if ($ExplicitPassword) { $ExplicitPassword } else { New-RandomPassword }
+    $passSecure = ConvertTo-SecureString $plainPassword -AsPlainText -Force
 
     try {
         if ($Type -match "(?i)^Local$") {
             $user = [ADSI]"WinNT://$env:COMPUTERNAME/$Username,user"
-            $user.SetPassword($newPlainPassword)
+            $user.SetPassword($plainPassword)
             $user.SetInfo()
-            [Console]::WriteLine("[+] Local user '$Username' rotated successfully.")
+            [Console]::WriteLine("[+] Local user '$Username' updated successfully.")
         } elseif ($Type -match "(?i)^Domain$") {
             Set-ADAccountPassword -Identity $Username -NewPassword $passSecure -Reset
             Set-ADUser -Identity $Username -PasswordNeverExpires $true
-            [Console]::WriteLine("[+] Domain user '$Username' rotated successfully.")
+            [Console]::WriteLine("[+] Domain user '$Username' updated successfully.")
         }
 
-        $OutputList.Value += "$Username,$newPlainPassword"
+        $OutputList.Value += "$Username,$plainPassword"
     } catch {
         [Console]::WriteLine("[-] Error changing password for $Username ($Type): " + $_.Exception.Message)
     }
@@ -99,7 +101,6 @@ function Rotate-KrbtgtAccount {
         Set-ADUser -Identity "krbtgt" -PasswordNeverExpires $true
         Write-Host " [+] Pass 2 complete. 'krbtgt' double-rotation finished." -ForegroundColor Green
 
-        # Only the current, active final password is saved for the screenshot
         $OutputList.Value += "krbtgt,$pass2"
     } catch {
         Write-Host "[-] Failed to rotate krbtgt: $($_.Exception.Message)" -ForegroundColor Red
@@ -114,7 +115,7 @@ Clear-Host
 [Console]::WriteLine("             AUTOMATED CREDENTIAL ROTATION SYSTEM                ")
 [Console]::WriteLine("=================================================================")
 Write-Host " [A] Rotate ALL accounts (Local & Domain, excluding krbtgt)"
-Write-Host " [S] Rotate a SINGLE specified user (Local or Domain)"
+Write-Host " [S] Rotate a SINGLE specified user (Auto or Custom password)"
 Write-Host " [K] Double-rotate the 'krbtgt' account"
 Write-Host " [Q] QUIT without changing anything"
 Write-Host "================================================================="
@@ -150,7 +151,20 @@ switch -Regex ($menuChoice) {
         } else {
             $tTypeChoice = Read-Host "Is this user [L]ocal or [D]omain? (L/D)"
             $targetType = if ($tTypeChoice -match "^[Ll]") { "Local" } else { "Domain" }
-            Set-AccountPassword -Username $target -Type $targetType -OutputList ([ref]$credentialOutput)
+
+            # Prompt for Auto vs Custom password
+            $passChoice = Read-Host "Password type: [A]uto-generate or [C]ustom? (A/C)"
+            $customPass = $null
+
+            if ($passChoice -match "^[Cc]") {
+                $customPass = Read-Host "Enter custom password for $target"
+                if ([string]::IsNullOrWhiteSpace($customPass)) {
+                    Write-Host "[-] Password cannot be blank. Aborting." -ForegroundColor Red
+                    exit
+                }
+            }
+
+            Set-AccountPassword -Username $target -Type $targetType -ExplicitPassword $customPass -OutputList ([ref]$credentialOutput)
         }
     }
 
@@ -248,15 +262,15 @@ if ($credentialOutput.Count -gt 0) {
 
         $key = [Console]::ReadKey($true)
 
-        # NEXT: L or Right Arrow
+        # NEXT: L, Right Arrow, Enter, Space
         if ($key.Key -eq [ConsoleKey]::L -or $key.Key -eq [ConsoleKey]::RightArrow -or $key.Key -eq [ConsoleKey]::Enter -or $key.Key -eq [ConsoleKey]::Spacebar) {
             if ($currentPage -lt ($totalPages - 1)) { $currentPage++ }
         }
-        # PREVIOUS: J or Left Arrow
+        # PREVIOUS: J, Left Arrow
         elseif ($key.Key -eq [ConsoleKey]::J -or $key.Key -eq [ConsoleKey]::LeftArrow) {
             if ($currentPage -gt 0) { $currentPage-- }
         }
-        # QUIT: Q or Escape
+        # QUIT: Q, Escape
         elseif ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
             break
         }
