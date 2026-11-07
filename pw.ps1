@@ -1,10 +1,6 @@
 <#
 .SYNOPSIS
     Automated Credential Rotation Script
-.DESCRIPTION
-    Generates strong, randomized passphrase-style credentials:
-    [Adjective]-[Color]-[Noun][Number][Special] (e.g., Sneaky-Black-Zebra42!)
-    Exports results to a timestamped file: PCR_h.mmtt.txt (Username,Password).
 .PARAMETER TargetUser
     Optional. Specify a single username to target instead of rotating all accounts.
 .PARAMETER TargetType
