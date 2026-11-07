@@ -1,23 +1,3 @@
-<#
-.SYNOPSIS
-    Zero-Trace Automated Credential Rotation Script
-.DESCRIPTION
-    Rotates credentials, displays them page-by-page in memory only,
-    disables transcription, wipes memory variables, and cleans console buffers.
-#>
-
-[CmdletBinding()]
-param(
-    [string]$TargetUser,
-    [string]$TargetType
-)
-
-# Normalize/validate TargetType if provided via CLI
-if ($TargetType -and ($TargetType -notmatch '^(?i:Local|Domain)$')) {
-    Write-Warning "TargetType must be either 'Local' or 'Domain'."
-    return
-}
-
 # --- ANTI-LEAK: Ensure PS Transcription is not recording the console ---
 try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
 
@@ -97,34 +77,84 @@ function Set-AccountPassword {
     }
 }
 
+function Rotate-KrbtgtAccount {
+    param(
+        [ref]$OutputList
+    )
+
+    Write-Host "`n[!] WARNING: Double-rotating krbtgt invalidates all active Golden Tickets." -ForegroundColor Yellow
+    Write-Host "[*] Executing first password rotation on 'krbtgt'..." -ForegroundColor Cyan
+    $pass1 = New-RandomPassword
+    $sec1  = ConvertTo-SecureString $pass1 -AsPlainText -Force
+    
+    try {
+        Set-ADAccountPassword -Identity "krbtgt" -NewPassword $sec1 -Reset
+        Write-Host " [+] Pass 1 complete. Pausing 5 seconds for replication..." -ForegroundColor Green
+        Start-Sleep -Seconds 5
+
+        Write-Host "[*] Executing second rotation (flushing previous Kerberos master key)..." -ForegroundColor Cyan
+        $pass2 = New-RandomPassword
+        $sec2  = ConvertTo-SecureString $pass2 -AsPlainText -Force
+        Set-ADAccountPassword -Identity "krbtgt" -NewPassword $sec2 -Reset
+        Set-ADUser -Identity "krbtgt" -PasswordNeverExpires $true
+        Write-Host " [+] Pass 2 complete. 'krbtgt' double-rotation finished." -ForegroundColor Green
+
+        # Only the current, active final password is saved for the screenshot
+        $OutputList.Value += "krbtgt,$pass2"
+    } catch {
+        Write-Host "[-] Failed to rotate krbtgt: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
 # ==========================================
-# 3. ROTATION EXECUTION
+# 3. INTERACTIVE MENU & EXECUTION
 # ==========================================
 Clear-Host
 [Console]::WriteLine("=================================================================")
 [Console]::WriteLine("             AUTOMATED CREDENTIAL ROTATION SYSTEM                ")
 [Console]::WriteLine("=================================================================")
+Write-Host " [A] Rotate ALL accounts (Local & Domain, excluding krbtgt)"
+Write-Host " [S] Rotate a SINGLE specified user (Local or Domain)"
+Write-Host " [K] Double-rotate the 'krbtgt' account"
+Write-Host " [Q] QUIT without changing anything"
+Write-Host "================================================================="
+
+$menuChoice = Read-Host "Select an option (A / S / K / Q)"
 
 $credentialOutput = @()
 
-if ($TargetUser) {
-    if (-not $TargetType) {
-        $choice = Read-Host "Is '$TargetUser' a [L]ocal or [D]omain account? (L/D)"
-        if ($choice -match "^[Ll]") { $TargetType = "Local" } else { $TargetType = "Domain" }
+switch -Regex ($menuChoice) {
+    "^[Qq]" {
+        Write-Host "`n[!] Aborted by user. No passwords were changed." -ForegroundColor Yellow
+        exit
     }
 
-    [Console]::WriteLine("[*] Running single-target mode on: $TargetUser ($TargetType)")
-    Set-AccountPassword -Username $TargetUser -Type $TargetType -OutputList ([ref]$credentialOutput)
-}
-else {
-    $interactiveCheck = Read-Host "Rotate [A]ll accounts or specify a [S]ingle user? (A/S)"
-    if ($interactiveCheck -match "^[Ss]") {
-        $TargetUser = Read-Host "Enter the exact Username"
-        $tTypeChoice = Read-Host "Is this user [L]ocal or [D]omain? (L/D)"
-        $TargetType = if ($tTypeChoice -match "^[Ll]") { "Local" } else { "Domain" }
-        
-        Set-AccountPassword -Username $TargetUser -Type $TargetType -OutputList ([ref]$credentialOutput)
-    } else {
+    "^[Kk]" {
+        if (-not (Get-CimInstance Win32_ComputerSystem).PartOfDomain) {
+            Write-Host "[-] Host is not a domain controller or part of a domain." -ForegroundColor Red
+            exit
+        }
+        Rotate-KrbtgtAccount -OutputList ([ref]$credentialOutput)
+    }
+
+    "^[Ss]" {
+        $target = Read-Host "Enter the exact Username"
+        if ([string]::IsNullOrWhiteSpace($target)) {
+            Write-Host "[-] Invalid username. Exiting." -ForegroundColor Red
+            exit
+        }
+
+        # If user explicitly enters krbtgt here, enforce the double-rotation
+        if ($target -ieq "krbtgt") {
+            Rotate-KrbtgtAccount -OutputList ([ref]$credentialOutput)
+        } else {
+            $tTypeChoice = Read-Host "Is this user [L]ocal or [D]omain? (L/D)"
+            $targetType = if ($tTypeChoice -match "^[Ll]") { "Local" } else { "Domain" }
+            Set-AccountPassword -Username $target -Type $targetType -OutputList ([ref]$credentialOutput)
+        }
+    }
+
+    "^[Aa]" {
         # 1. Local Accounts
         [Console]::WriteLine("`n[*] Enumerating & rotating Local Accounts...")
         $localUsers = Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
@@ -160,13 +190,25 @@ else {
 
             if ($allDomainUsers.Count -gt 0) {
                 foreach ($dUser in ($allDomainUsers | Sort-Object -Unique)) {
-                    if ($dUser.EndsWith("$")) { continue }
+                    # Skip computer accounts, MSAs, Exchange mailboxes, and KRBTGT
+                    if (
+                        $dUser.EndsWith("$") -or 
+                        $dUser -match '^(krbtgt|HealthMailbox|SM_|\$)'
+                    ) { 
+                        continue 
+                    }
+
                     Set-AccountPassword -Username $dUser -Type "Domain" -OutputList ([ref]$credentialOutput)
                 }
             } else {
                 [Console]::WriteLine("[-] No domain users found or unable to contact domain controller.")
             }
         }
+    }
+
+    default {
+        Write-Host "[-] Invalid selection. Quitting without changes." -ForegroundColor Red
+        exit
     }
 }
 
@@ -198,20 +240,23 @@ if ($credentialOutput.Count -gt 0) {
         Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
         
         $navControls = @()
-        if ($currentPage -lt ($totalPages - 1)) { $navControls += "[Right Arrow / N] Next" }
-        if ($currentPage -gt 0)                { $navControls += "[Left Arrow / P] Previous" }
+        if ($currentPage -lt ($totalPages - 1)) { $navControls += "[L / Right Arrow] Next" }
+        if ($currentPage -gt 0)                { $navControls += "[J / Left Arrow] Previous" }
         $navControls += "[Q / Esc] Quit"
 
         Write-Host ($navControls -join "  |  ") -ForegroundColor Yellow
 
         $key = [Console]::ReadKey($true)
 
-        if ($key.Key -eq [ConsoleKey]::RightArrow -or $key.Key -eq [ConsoleKey]::N -or $key.Key -eq [ConsoleKey]::Enter -or $key.Key -eq [ConsoleKey]::Spacebar) {
+        # NEXT: L or Right Arrow
+        if ($key.Key -eq [ConsoleKey]::L -or $key.Key -eq [ConsoleKey]::RightArrow -or $key.Key -eq [ConsoleKey]::Enter -or $key.Key -eq [ConsoleKey]::Spacebar) {
             if ($currentPage -lt ($totalPages - 1)) { $currentPage++ }
         }
-        elseif ($key.Key -eq [ConsoleKey]::LeftArrow -or $key.Key -eq [ConsoleKey]::P -or $key.Key -eq [ConsoleKey]::B) {
+        # PREVIOUS: J or Left Arrow
+        elseif ($key.Key -eq [ConsoleKey]::J -or $key.Key -eq [ConsoleKey]::LeftArrow) {
             if ($currentPage -gt 0) { $currentPage-- }
         }
+        # QUIT: Q or Escape
         elseif ($key.Key -eq [ConsoleKey]::Q -or $key.Key -eq [ConsoleKey]::Escape) {
             break
         }
@@ -237,4 +282,4 @@ try {
     [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory()
 } catch {}
 
-Write-Host "[+] Passwords rotated, screenshots completed, and session memory cleared." -ForegroundColor Green
+Write-Host "[+] Session memory scrubbed and console cleared." -ForegroundColor Green
