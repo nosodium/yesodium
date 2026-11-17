@@ -367,8 +367,8 @@ function Invoke-HardeningSequence {
     Write-Output "[+] [8/9] Enforcing LDAP Signing & Channel Binding (Anti-PetitPotam)..."
     $ntdsParams = "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters"
     if (Test-Path $ntdsParams) {
-        Set-ItemProperty -Path $ntdsParams -Name "LDAPServerIntegrity" -Value 2 -Type DWord -Force
-        Set-ItemProperty -Path $ntdsParams -Name "LdapEnforceChannelBinding" -Value 2 -Type DWord -Force
+        Set-ItemProperty -Path $ntdsParams -Name "LDAPServerIntegrity" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $ntdsParams -Name "LdapEnforceChannelBinding" -Value 1 -Type DWord -Force
         Add-AuditEntry "Active Directory" "LDAP Signing & CBT" "VULNERABLE (Unsigned Allowed)" "Enforced LDAP Server Integrity & Channel Binding"
         Write-Output "    -> LDAP Signing and Channel Binding enforced."
     }
