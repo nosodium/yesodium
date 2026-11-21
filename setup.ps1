@@ -26,6 +26,7 @@ $ScriptList = @(
     "pw.ps1",
     "fw.ps1",
     "harden.ps1",
+    "bharden.ps1",
     "secpol.ps1",
     "auditpost.ps1",
     "tools.ps1",
