@@ -1,15 +1,14 @@
 <#
 .SYNOPSIS
-    CCDC Universal Domain Controller Firewall Engine (v4 - Friendly Service Names)
+    CCDC Universal Firewall Engine (v6 - T1562 Defense, Generic Mode & AD Modes)
 .DESCRIPTION
     Compatible across Windows Server 2012 through 2025. Pure ASCII.
-    - Displays current profile states (Domain, Private, Public)
-    - Enforces Default Inbound: BLOCK and Default Outbound: BLOCK
-    - Disables all non-essential / pre-existing inbound AND outbound rules (kills C2 beacons)
-    - Injects mirrored Inbound (localport) and Outbound (remoteport) Active Directory rules
-    - Provides interactive custom rule opener that automatically mirrors outbound
-    - Clean tabular output with human-readable SERVICE / ROLE descriptions
-    - Full atomic backup and restore via .wfw snapshots
+    - [T1562 Repair]: Strips registry DENY locks, re-registers DLLs, repairs BFE/MpsSvc
+    - [Generic Mode]: Inbound BLOCK / Outbound ALLOW (NO AD Rules - Best for Borgar)
+    - [Standard DC Mode]: Inbound BLOCK / Outbound ALLOW + Active Directory Rules
+    - [Strict DC Mode]: Inbound BLOCK / Outbound BLOCK + Mirrored AD Rules
+    - Interactive custom rule opener with optional outbound mirroring
+    - Tabular active rule inspection and atomic .wfw backup/restore
 #>
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -50,7 +49,6 @@ function Get-PortServiceDescription {
         return $portMap[$Port]
     }
 
-    # Extract name from custom rule format (e.g., CCDC_Custom_Keycloak_In -> Keycloak)
     if ($RuleName -match "CCDC_Custom_(.*)_(In|Out)") {
         return "Custom Service (" + $matches[1] + ")"
     }
@@ -104,56 +102,209 @@ function Restore-FirewallConfiguration {
     Show-FirewallProfileStatus
 }
 
-function Add-CustomRule {
+# ====================================================================
+# T1562 REMEDIATION: REPAIR & UNBREAK FIREWALL SUBSYSTEM
+# ====================================================================
+
+function Repair-FirewallSubsystem {
     Write-Output "`n================================================================="
-    Write-Output "               ADD CUSTOM FIREWALL RULE                          "
+    Write-Output "       REPAIRING FIREWALL SUBSYSTEM (T1562 ANTI-TAMPER FIX)      "
     Write-Output "================================================================="
-    $rName = Read-Host "Enter rule name (e.g. Keycloak or WebService)"
-    if ([string]::IsNullOrWhiteSpace($rName)) {
-        Write-Output "[-] Rule name cannot be empty."
-        return
+    Write-Output "[*] Resolving Registry Locks, Service Sabotage, & DLL Tampering..."
+
+    # 1. Strip Deny ACLs & Grant Administrators/SYSTEM Full Control on Firewall Registry
+    $regTargets = @(
+        "HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy",
+        "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\MpsSvc",
+        "HKLM:\SYSTEM\CurrentControlSet\Services\BFE"
+    )
+
+    foreach ($regPath in $regTargets) {
+        if (-not (Test-Path $regPath)) {
+            New-Item -Path $regPath -Force | Out-Null
+        }
+        try {
+            $acl = Get-Acl -Path $regPath
+            $denyRules = $acl.Access | Where-Object { $_.AccessControlType -eq "Deny" }
+            foreach ($dr in $denyRules) {
+                $acl.RemoveAccessRule($dr) | Out-Null
+            }
+            $adminSec = New-Object System.Security.Principal.NTAccount("BUILTIN\Administrators")
+            $sysSec   = New-Object System.Security.Principal.NTAccount("NT AUTHORITY\SYSTEM")
+            $adminRule = New-Object System.Security.AccessControl.RegistryAccessRule($adminSec, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+            $sysRule   = New-Object System.Security.AccessControl.RegistryAccessRule($sysSec, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+            $acl.SetAccessRule($adminRule)
+            $acl.SetAccessRule($sysRule)
+            Set-Acl -Path $regPath -AclObject $acl -ErrorAction SilentlyContinue
+            Write-Output ("  [+] Restored Full Control permissions on: " + ($regPath -split "\\")[-1])
+        } catch {
+            Write-Output ("  [-] Could not modify ACL on {0}: {1}" -f $regPath, $_.Exception.Message)
+        }
     }
 
-    $proto = Read-Host "Enter protocol ([T]CP / [U]DP - Default: TCP)"
-    $protocol = if ($proto -match "^[uU]") { "UDP" } else { "TCP" }
+    # 2. Re-register Core Firewall DLLs
+    Write-Output "`n[*] Re-registering Firewall COM components and DLLs..."
+    cmd.exe /c "regsvr32.exe /s %SystemRoot%\System32\firewallapi.dll" 2>$null | Out-Null
+    cmd.exe /c "regsvr32.exe /s %SystemRoot%\System32\bfe.dll" 2>$null | Out-Null
+    Write-Output "  [+] firewallapi.dll and bfe.dll re-registered."
 
-    $port = Read-Host "Enter port number(s) (e.g. 80 or 80,443 or 8080-8090)"
-    if ([string]::IsNullOrWhiteSpace($port)) {
-        Write-Output "[-] Port cannot be empty."
-        return
+    # 3. Repair & Force Start Services (BFE & MpsSvc)
+    Write-Output "`n[*] Repairing Base Filtering Engine (BFE) & Firewall (MpsSvc) Services..."
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\BFE" -Name "Start" -Value 2 -Type DWord -Force
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\MpsSvc" -Name "Start" -Value 2 -Type DWord -Force
+
+    cmd.exe /c "sc.exe config bfe start= auto" 2>$null | Out-Null
+    cmd.exe /c "sc.exe start bfe" 2>$null | Out-Null
+    Start-Sleep -Seconds 1
+
+    cmd.exe /c "sc.exe config mpssvc start= auto" 2>$null | Out-Null
+    cmd.exe /c "sc.exe start mpssvc" 2>$null | Out-Null
+    Start-Sleep -Seconds 1
+
+    $bfeStatus = (Get-Service -Name "BFE" -ErrorAction SilentlyContinue).Status
+    $mpsStatus = (Get-Service -Name "MpsSvc" -ErrorAction SilentlyContinue).Status
+    Write-Output ("  [+] BFE Service Status   : " + $bfeStatus)
+    Write-Output ("  [+] MpsSvc Service Status: " + $mpsStatus)
+
+    # 4. Factory Reset the Firewall Engine
+    Write-Output "`n[*] Running Factory Reset on Firewall Database..."
+    cmd.exe /c "netsh advfirewall reset" 2>$null | Out-Null
+    Write-Output "  [+] Firewall rules database reset to clean default state."
+
+    # 5. Enable Local Rule Merging
+    $profiles = @("DomainProfile", "PrivateProfile", "PublicProfile", "StandardProfile")
+    foreach ($p in $profiles) {
+        $pPath = "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\$p"
+        if (-not (Test-Path $pPath)) { New-Item -Path $pPath -Force | Out-Null }
+        Set-ItemProperty -Path $pPath -Name "AllowLocalPolicyMerge" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $pPath -Name "AllowLocalIPsecPolicyMerge" -Value 1 -Type DWord -Force
     }
+    netsh advfirewall set allprofiles settings localfirewallrules enable | Out-Null
+    Write-Output "  [+] Local Admin Rule Merging enabled."
 
-    $mirrorOut = Read-Host "Mirror this rule for Outbound traffic as well? ([Y]es / [N]o - Default: Y)"
-
-    # 1. Add Inbound Rule (localport)
-    $inName = "CCDC_Custom_" + $rName + "_In"
-    Write-Output ("[*] Creating Inbound Rule: " + $inName + " (" + $protocol + " LocalPort: " + $port + ")...")
-    cmd.exe /c "netsh advfirewall firewall add rule name=`"$inName`" dir=in action=allow protocol=$protocol localport=$port enable=yes profile=any" 2>$null | Out-Null
-    Write-Output ("  [+] Inbound rule '" + $inName + "' active.")
-
-    # 2. Add Mirrored Outbound Rule (remoteport)
-    if ($mirrorOut -ne 'N' -and $mirrorOut -ne 'n') {
-        $outName = "CCDC_Custom_" + $rName + "_Out"
-        Write-Output ("[*] Creating Mirrored Outbound Rule: " + $outName + " (" + $protocol + " RemotePort: " + $port + ")...")
-        cmd.exe /c "netsh advfirewall firewall add rule name=`"$outName`" dir=out action=allow protocol=$protocol remoteport=$port enable=yes profile=any" 2>$null | Out-Null
-        Write-Output ("  [+] Mirrored outbound rule '" + $outName + "' active.")
-    }
+    Write-Output "`n================================================================="
+    Write-Output "               T1562 REPAIR SEQUENCE FINISHED                    "
+    Write-Output "================================================================="
+    Show-FirewallProfileStatus
 }
 
-function Invoke-HardeningSequence {
+# ====================================================================
+# GENERIC / MEMBER SERVER MODE: BLOCK INBOUND / ALLOW OUTBOUND (NO AD RULES)
+# ====================================================================
+
+function Invoke-GenericFirewallMode {
     Show-FirewallProfileStatus
+    Backup-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Generic Baseline"
 
-    # 1. Pre-Hardening Snapshot
-    Backup-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Hardening Baseline"
-
-    # 2. Remote Access Safeguard Check
     Write-Output "`n[*] REMOTE ACCESS SAFEGUARD:"
-    Write-Output "[!] If managing this server over RDP (3389) or WinRM (5985),"
-    Write-Output "    disabling existing rules could terminate your active session."
+    Write-Output "[!] Inbound traffic will be BLOCKED by default."
+    $allowRDP = Read-Host "Allow RDP (TCP 3389) to prevent lockout? ([Y]es / [N]o - Default: Y)"
+    $allowWinRM = Read-Host "Allow WinRM (TCP 5985)? ([Y]es / [N]o - Default: N)"
+
+    Write-Output "`n[*] [1/3] Enabling Firewall on all profiles (Domain, Private, Public)..."
+    cmd.exe /c "netsh advfirewall set allprofiles state on" 2>$null | Out-Null
+
+    Write-Output "[*] [2/3] Setting Policies: Inbound = BLOCK, Outbound = ALLOW..."
+    cmd.exe /c "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound" 2>$null | Out-Null
+
+    Write-Output "[*] [3/3] Disabling pre-existing inbound rules to eliminate backdoors..."
+    cmd.exe /c "netsh advfirewall firewall set rule name=all dir=in new enable=no" 2>$null | Out-Null
+
+    if ($allowRDP -ne 'N' -and $allowRDP -ne 'n') {
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_RDP_In`" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any" 2>$null | Out-Null
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_RDP_In (TCP 3389 - Remote Desktop)"
+    }
+    if ($allowWinRM -eq 'Y' -or $allowWinRM -eq 'y') {
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_WinRM_In`" dir=in action=allow protocol=TCP localport=5985 enable=yes profile=any" 2>$null | Out-Null
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_WinRM_In (TCP 5985 - WinRM Remoting)"
+    }
+
+    Backup-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Generic Baseline (Inbound Block / Outbound Allow, No AD)"
+    Write-Output "`n[+] Generic Firewall Mode Active!"
+    Write-Output "    -> All profiles ON"
+    Write-Output "    -> Default Inbound: BLOCKED"
+    Write-Output "    -> Default Outbound: ALLOWED"
+    Write-Output "    -> NO Active Directory rules added."
+    Write-Output "    (Use Option [5] to add ports for the Food Ordering Service)"
+    Show-FirewallProfileStatus
+}
+
+# ====================================================================
+# STANDARD DC MODE: BLOCK INBOUND / ALLOW OUTBOUND + AD RULES
+# ====================================================================
+
+function Invoke-StandardFirewallMode {
+    Show-FirewallProfileStatus
+    Backup-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Standard Mode Baseline"
+
+    Write-Output "`n[*] REMOTE ACCESS SAFEGUARD:"
     $allowRDP = Read-Host "Allow RDP (TCP 3389)? ([Y]es / [N]o - Default: Y)"
     $allowWinRM = Read-Host "Allow WinRM (TCP 5985)? ([Y]es / [N]o - Default: N)"
 
-    Write-Output "`n[*] [1/6] Enabling Firewall on all profiles (Domain, Private, Public)..."
+    Write-Output "`n[*] [1/4] Turning Firewall ON across all profiles..."
+    cmd.exe /c "netsh advfirewall set allprofiles state on" 2>$null | Out-Null
+
+    Write-Output "[*] [2/4] Setting Policy: Inbound = BLOCK, Outbound = ALLOW..."
+    cmd.exe /c "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound" 2>$null | Out-Null
+
+    Write-Output "[*] [3/4] Disabling pre-existing inbound rules to eliminate backdoors..."
+    cmd.exe /c "netsh advfirewall firewall set rule name=all dir=in new enable=no" 2>$null | Out-Null
+
+    Write-Output "[*] [4/4] Injecting Core Inbound Rules (AD + Management)..."
+    $adRules = @(
+        @{ Name = "CCDC_AD_DNS_UDP"; Proto = "UDP"; Port = "53" },
+        @{ Name = "CCDC_AD_DNS_TCP"; Proto = "TCP"; Port = "53" },
+        @{ Name = "CCDC_AD_Kerberos_UDP"; Proto = "UDP"; Port = "88" },
+        @{ Name = "CCDC_AD_Kerberos_TCP"; Proto = "TCP"; Port = "88" },
+        @{ Name = "CCDC_AD_Kerberos_kpasswd_UDP"; Proto = "UDP"; Port = "464" },
+        @{ Name = "CCDC_AD_Kerberos_kpasswd_TCP"; Proto = "TCP"; Port = "464" },
+        @{ Name = "CCDC_AD_LDAP_TCP"; Proto = "TCP"; Port = "389" },
+        @{ Name = "CCDC_AD_LDAP_UDP"; Proto = "UDP"; Port = "389" },
+        @{ Name = "CCDC_AD_LDAPS_TCP"; Proto = "TCP"; Port = "636" },
+        @{ Name = "CCDC_AD_GlobalCatalog_TCP"; Proto = "TCP"; Port = "3268" },
+        @{ Name = "CCDC_AD_GlobalCatalog_SSL_TCP"; Proto = "TCP"; Port = "3269" },
+        @{ Name = "CCDC_AD_SMB_TCP"; Proto = "TCP"; Port = "445" },
+        @{ Name = "CCDC_AD_RPC_EndpointMapper_TCP"; Proto = "TCP"; Port = "135" },
+        @{ Name = "CCDC_AD_RPC_DynamicHighPorts_TCP"; Proto = "TCP"; Port = "49152-65535" },
+        @{ Name = "CCDC_AD_W32Time_NTP_UDP"; Proto = "UDP"; Port = "123" }
+    )
+
+    foreach ($r in $adRules) {
+        $inName = $r.Name + "_In"
+        $desc = Get-PortServiceDescription -Port $r.Port -RuleName $inName
+        cmd.exe /c "netsh advfirewall firewall delete rule name=`"$inName`"" 2>$null | Out-Null
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"$inName`" dir=in action=allow protocol=$($r.Proto) localport=$($r.Port) enable=yes profile=any" 2>$null | Out-Null
+        Write-Output ("  [+] Inbound Allowed: " + $inName.PadRight(35) + " (" + $r.Proto + " Port: " + $r.Port + " - " + $desc + ")")
+    }
+
+    if ($allowRDP -ne 'N' -and $allowRDP -ne 'n') {
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_RDP_In`" dir=in action=allow protocol=TCP localport=3389 enable=yes profile=any" 2>$null | Out-Null
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_RDP_In (TCP 3389 - Remote Desktop)"
+    }
+    if ($allowWinRM -eq 'Y' -or $allowWinRM -eq 'y') {
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"CCDC_Mgmt_WinRM_In`" dir=in action=allow protocol=TCP localport=5985 enable=yes profile=any" 2>$null | Out-Null
+        Write-Output "  [+] Management Allowed : CCDC_Mgmt_WinRM_In (TCP 5985 - WinRM Remoting)"
+    }
+
+    Backup-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Standard Baseline (Inbound Block / Outbound Allow)"
+    Write-Output "`n[+] Standard Mode Active. All outbound traffic is permitted."
+    Show-FirewallProfileStatus
+}
+
+# ====================================================================
+# STRICT DC MODE: BLOCK INBOUND / BLOCK OUTBOUND + AD RULES
+# ====================================================================
+
+function Invoke-StrictFirewallMode {
+    Show-FirewallProfileStatus
+    Backup-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Strict Baseline"
+
+    Write-Output "`n[*] REMOTE ACCESS SAFEGUARD:"
+    $allowRDP = Read-Host "Allow RDP (TCP 3389)? ([Y]es / [N]o - Default: Y)"
+    $allowWinRM = Read-Host "Allow WinRM (TCP 5985)? ([Y]es / [N]o - Default: N)"
+
+    Write-Output "`n[*] [1/6] Enabling Firewall on all profiles..."
     cmd.exe /c "netsh advfirewall set allprofiles state on" 2>$null | Out-Null
 
     Write-Output "[*] [2/6] Enforcing Strict Default Policies: Inbound = BLOCK, Outbound = BLOCK..."
@@ -162,10 +313,8 @@ function Invoke-HardeningSequence {
     Write-Output "[*] [3/6] Disabling all pre-existing Inbound and Outbound rules..."
     cmd.exe /c "netsh advfirewall firewall set rule name=all dir=in new enable=no" 2>$null | Out-Null
     cmd.exe /c "netsh advfirewall firewall set rule name=all dir=out new enable=no" 2>$null | Out-Null
-    Write-Output "  [+] All pre-existing inbound and outbound rules disabled."
 
-    Write-Output "[*] [4/6] Injecting Core Active Directory Inbound Rules (localport)..."
-
+    Write-Output "[*] [4/6] Injecting Core Active Directory Inbound Rules..."
     $adRules = @(
         @{ Name = "CCDC_AD_DNS_UDP"; Proto = "UDP"; Port = "53" },
         @{ Name = "CCDC_AD_DNS_TCP"; Proto = "TCP"; Port = "53" },
@@ -192,7 +341,7 @@ function Invoke-HardeningSequence {
         Write-Output ("  [+] Inbound Allowed  : " + $inName.PadRight(35) + " (" + $r.Proto + " Port: " + $r.Port + " - " + $desc + ")")
     }
 
-    Write-Output "`n[*] [5/6] Injecting Mirrored Outbound Rules (remoteport) for AD Operation..."
+    Write-Output "`n[*] [5/6] Injecting Mirrored Outbound Rules for AD Operation..."
     foreach ($r in $adRules) {
         $outName = $r.Name + "_Out"
         $desc = Get-PortServiceDescription -Port $r.Port -RuleName $outName
@@ -213,14 +362,44 @@ function Invoke-HardeningSequence {
     }
 
     Write-Output "`n[*] [6/6] Creating Hardened Baseline Backup..."
-    Backup-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Hardened CCDC Baseline (Inbound/Outbound Strict)"
-
-    Write-Output "`n================================================================="
-    Write-Output "            FIREWALL HARDENING SEQUENCE COMPLETED                "
-    Write-Output "================================================================="
+    Backup-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Strict Baseline (Inbound Block / Outbound Block)"
     Show-FirewallProfileStatus
-    Write-Output "[+] Pre-Hardening backup    : $PreBackupFile"
-    Write-Output "[+] Hardened baseline backup: $HardenedBackupFile"
+}
+
+function Add-CustomRule {
+    Write-Output "`n================================================================="
+    Write-Output "               ADD CUSTOM FIREWALL RULE                          "
+    Write-Output "================================================================="
+    $rName = Read-Host "Enter rule name (e.g. FoodOrderingService)"
+    if ([string]::IsNullOrWhiteSpace($rName)) {
+        Write-Output "[-] Rule name cannot be empty."
+        return
+    }
+
+    $proto = Read-Host "Enter protocol ([T]CP / [U]DP - Default: TCP)"
+    $protocol = if ($proto -match "^[uU]") { "UDP" } else { "TCP" }
+
+    $port = Read-Host "Enter port number(s) (e.g. 80 or 80,443 or 8080)"
+    if ([string]::IsNullOrWhiteSpace($port)) {
+        Write-Output "[-] Port cannot be empty."
+        return
+    }
+
+    $mirrorOut = Read-Host "Mirror this rule for Outbound traffic? ([Y]es / [N]o - Default: N)"
+
+    # Add Inbound Rule (localport)
+    $inName = "CCDC_Custom_" + $rName + "_In"
+    Write-Output ("[*] Creating Inbound Rule: " + $inName + " (" + $protocol + " LocalPort: " + $port + ")...")
+    cmd.exe /c "netsh advfirewall firewall add rule name=`"$inName`" dir=in action=allow protocol=$protocol localport=$port enable=yes profile=any" 2>$null | Out-Null
+    Write-Output ("  [+] Inbound rule '" + $inName + "' active.")
+
+    # Add Mirrored Outbound Rule if requested
+    if ($mirrorOut -eq 'Y' -or $mirrorOut -eq 'y') {
+        $outName = "CCDC_Custom_" + $rName + "_Out"
+        Write-Output ("[*] Creating Mirrored Outbound Rule: " + $outName + " (" + $protocol + " RemotePort: " + $port + ")...")
+        cmd.exe /c "netsh advfirewall firewall add rule name=`"$outName`" dir=out action=allow protocol=$protocol remoteport=$port enable=yes profile=any" 2>$null | Out-Null
+        Write-Output ("  [+] Mirrored outbound rule '" + $outName + "' active.")
+    }
 }
 
 function Show-ActiveRules {
@@ -230,7 +409,6 @@ function Show-ActiveRules {
 
     $rules = @()
 
-    # Method 1: PowerShell NetSecurity Module
     if (Get-Command Get-NetFirewallRule -ErrorAction SilentlyContinue) {
         $netRules = Get-NetFirewallRule -DisplayName "CCDC_*" -ErrorAction SilentlyContinue | Where-Object { $_.Enabled -eq 'True' }
         foreach ($nr in $netRules) {
@@ -247,42 +425,6 @@ function Show-ActiveRules {
                 Port        = $port
                 Description = (Get-PortServiceDescription -Port $port -RuleName $nr.DisplayName)
             }
-        }
-    }
-
-    # Method 2: Block Parser Fallback for Netsh
-    if ($rules.Count -eq 0) {
-        $rawOutput = cmd.exe /c "netsh advfirewall firewall show rule name=all" 2>$null
-        $cur = $null
-
-        foreach ($line in $rawOutput) {
-            $t = $line.Trim()
-            if ($t -match "^Rule Name:\s*(CCDC_.*)") {
-                if ($cur -and $cur.Enabled -eq "Yes") { 
-                    $rules += New-Object PSObject -Property $cur 
-                }
-                $cur = @{ Name = $matches[1]; Enabled = ""; Direction = ""; Protocol = ""; Port = ""; Description = "" }
-            } elseif ($cur) {
-                if ($t -match "^Rule Name:") {
-                    if ($cur.Enabled -eq "Yes") { $rules += New-Object PSObject -Property $cur }
-                    $cur = $null
-                } elseif ($t -match "^Enabled:\s*(.+)") {
-                    $cur.Enabled = $matches[1]
-                } elseif ($t -match "^Direction:\s*(.+)") {
-                    $cur.Direction = if ($matches[1] -match "In") { "INBOUND" } else { "OUTBOUND" }
-                } elseif ($t -match "^Protocol:\s*(.+)") {
-                    $cur.Protocol = $matches[1].ToUpper()
-                } elseif ($t -match "^LocalPort:\s*(.+)" -and $cur.Direction -eq "INBOUND") {
-                    $cur.Port = $matches[1]
-                    $cur.Description = Get-PortServiceDescription -Port $matches[1] -RuleName $cur.Name
-                } elseif ($t -match "^RemotePort:\s*(.+)" -and $cur.Direction -eq "OUTBOUND") {
-                    $cur.Port = $matches[1]
-                    $cur.Description = Get-PortServiceDescription -Port $matches[1] -RuleName $cur.Name
-                }
-            }
-        }
-        if ($cur -and $cur.Enabled -eq "Yes") { 
-            $rules += New-Object PSObject -Property $cur 
         }
     }
 
@@ -309,7 +451,7 @@ function Show-ActiveRules {
             Write-Output ("{0,-6} {1,-14} {2,-38} {3}" -f $r.Protocol, $r.Port, $r.Description, $r.Name)
         }
     } else {
-        Write-Output "No active CCDC outbound allow rules."
+        Write-Output "Outbound is default ALLOW (or no custom rules active)."
     }
     Write-Output "`n========================================================================================================================"
 }
@@ -320,28 +462,34 @@ function Show-ActiveRules {
 
 while ($true) {
     Write-Output "`n========================================================"
-    Write-Output "    CCDC DOMAIN CONTROLLER FIREWALL ENGINE (STRICT)     "
+    Write-Output "          CCDC FIREWALL MANAGEMENT & REPAIR             "
     Write-Output "========================================================"
-    Write-Output "[1] Enforce Inbound BLOCK / Outbound BLOCK + Mirrored AD Rules"
-    Write-Output "[2] Add Custom Rule (Opens Inbound & Auto-Mirrors Outbound)"
-    Write-Output "[3] Restore Pre-Hardening Backup (Rollback Original)"
-    Write-Output "[4] Restore Hardened CCDC Baseline (Recover from Wipe)"
-    Write-Output "[5] View Current Firewall Status & Active CCDC Rules"
+    Write-Output "[1] Repair / Reinstall Firewall Subsystem (Fix T1562 Locks)"
+    Write-Output "[2] Generic Mode  : BLOCK Inbound & ALLOW Outbound (NO AD Rules)"
+    Write-Output "[3] Standard DC   : BLOCK Inbound & ALLOW Outbound + AD Rules"
+    Write-Output "[4] Strict DC     : BLOCK Inbound & BLOCK Outbound + AD Rules"
+    Write-Output "[5] Add Custom Port Rule (e.g. Food Ordering Service)"
+    Write-Output "[6] Restore Pre-Hardening Baseline Snapshot"
+    Write-Output "[7] Restore Hardened CCDC Baseline Snapshot"
+    Write-Output "[8] View Current Firewall Status & Active Rules"
     Write-Output "[Q] Quit"
     Write-Output "--------------------------------------------------------"
 
-    $choice = Read-Host "Select an option [1-5, Q]"
+    $choice = Read-Host "Select an option [1-8, Q]"
 
     switch ($choice.ToUpper()) {
-        "1" { Invoke-HardeningSequence }
-        "2" { Add-CustomRule }
-        "3" { Restore-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Hardening Configuration" }
-        "4" { Restore-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Hardened CCDC Baseline" }
-        "5" { 
+        "1" { Repair-FirewallSubsystem }
+        "2" { Invoke-GenericFirewallMode }
+        "3" { Invoke-StandardFirewallMode }
+        "4" { Invoke-StrictFirewallMode }
+        "5" { Add-CustomRule }
+        "6" { Restore-FirewallConfiguration -FilePath $PreBackupFile -Description "Pre-Hardening Configuration" }
+        "7" { Restore-FirewallConfiguration -FilePath $HardenedBackupFile -Description "Hardened CCDC Baseline" }
+        "8" { 
             Show-FirewallProfileStatus 
             Show-ActiveRules
         }
         "Q" { Write-Output "Exiting firewall engine."; return }
-        Default { Write-Output "[!] Invalid choice. Please enter 1-5, or Q." }
+        Default { Write-Output "[!] Invalid choice. Please enter 1-8, or Q." }
     }
 }
