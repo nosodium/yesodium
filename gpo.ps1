@@ -3,7 +3,8 @@
     Domain Controller Group Policy Hardening, Deployment, & Rollback Engine
 .DESCRIPTION
     Designed for Windows Server 2019/2022 Active Directory Domain Controllers.
-    - Full backup and rollback of all existing GPOs and Default Domain Password Policy.
+    - Full backup and rollback of all existing GPOs, MachineAccountQuota, and Password Policy.
+    - Sets ms-DS-MachineAccountQuota to 0 (Prevents standard users from adding domain machines).
     - Creates a baseline GPO ('CCDC_Hardened_Baseline') and links it to the domain root.
     - Hardens RDP (1 session limit, NLA), LSASS (RunAsPPL, WDigest), SMB, and LLMNR.
     - Explicitly allows local member servers (borgar) to manage their local firewalls.
@@ -47,7 +48,7 @@ function Get-DomainDN {
 # ====================================================================
 
 function Backup-AllGPOs {
-    Write-Output "`n[*] Initiating Full GPO & Domain Password Policy Backup..."
+    Write-Output "`n[*] Initiating Full GPO, Quota, & Domain Password Policy Backup..."
     if (-not (Test-Path "$BackupRoot\GPO_Backups")) {
         New-Item -ItemType Directory -Path "$BackupRoot\GPO_Backups" -Force | Out-Null
     }
@@ -62,7 +63,19 @@ function Backup-AllGPOs {
         Write-Output "  [-] Failed to backup domain password policy: $_"
     }
 
-    # 2. Backup all active GPOs in the domain
+    # 2. Backup Machine Account Quota
+    try {
+        $domainDN = Get-DomainDN
+        $domainEntry = [ADSI]"LDAP://$domainDN"
+        $currentQuota = $domainEntry.Properties["ms-DS-MachineAccountQuota"].Value
+        if ($null -eq $currentQuota) { $currentQuota = 10 }
+        @{ MachineAccountQuota = [int]$currentQuota } | Export-Clixml -Path "$BackupRoot\MachineAccountQuota_Backup.xml"
+        Write-Output ("  [+] Backed up ms-DS-MachineAccountQuota (Current: {0})." -f $currentQuota)
+    } catch {
+        Write-Output "  [-] Failed to backup MachineAccountQuota: $_"
+    }
+
+    # 3. Backup all active GPOs in the domain
     try {
         $backupResult = Backup-Gpo -All -Path "$BackupRoot\GPO_Backups"
         Write-Output ("  [+] Successfully backed up {0} Group Policy Object(s) to {1}\GPO_Backups" -f $backupResult.Count, $BackupRoot)
@@ -77,7 +90,7 @@ function Backup-AllGPOs {
 
 function Invoke-GPORestoration {
     Write-Output "================================================================="
-    Write-Output "              RESTORING GPOs & PASSWORD POLICY                   "
+    Write-Output "          RESTORING GPOs, QUOTA & PASSWORD POLICY                "
     Write-Output "================================================================="
 
     $domainDN = Get-DomainDN
@@ -95,7 +108,22 @@ function Invoke-GPORestoration {
         Write-Output ("  [+] Removed GPO: {0}" -f $GpoName)
     }
 
-    # 2. Restore Original Domain Password Policy
+    # 2. Restore Machine Account Quota
+    $quotaFile = "$BackupRoot\MachineAccountQuota_Backup.xml"
+    if (Test-Path $quotaFile) {
+        Write-Output "[*] Restoring ms-DS-MachineAccountQuota from backup..."
+        try {
+            $savedQuota = (Import-Clixml -Path $quotaFile).MachineAccountQuota
+            $domainEntry = [ADSI]"LDAP://$domainDN"
+            $domainEntry.Put("ms-DS-MachineAccountQuota", [int]$savedQuota)
+            $domainEntry.SetInfo()
+            Write-Output ("  [+] Restored ms-DS-MachineAccountQuota to: {0}" -f $savedQuota)
+        } catch {
+            Write-Output "  [-] Failed to restore MachineAccountQuota: $_"
+        }
+    }
+
+    # 3. Restore Original Domain Password Policy
     $passFile = "$BackupRoot\DefaultDomainPasswordPolicy_Backup.xml"
     if (Test-Path $passFile) {
         Write-Output "[*] Restoring Default Domain Password Policy from backup..."
@@ -115,7 +143,7 @@ function Invoke-GPORestoration {
         }
     }
 
-    # 3. Restore all original GPOs from backup
+    # 4. Restore all original GPOs from backup
     if (Test-Path "$BackupRoot\GPO_Backups") {
         Write-Output "[*] Restoring GPOs from backup directory..."
         try {
@@ -149,8 +177,26 @@ function Invoke-GPOHardening {
     Write-Output "       CREATING & APPLYING HARDENED BASELINE GROUP POLICY        "
     Write-Output "================================================================="
 
-    # 1. Harden Domain Password Policy (Safe for CCDC Scoring)
-    Write-Output "`n[+] [1/4] Applying Scoring-Safe Domain Password Policy..."
+    # 1. Machine Account Quota (NoPac Defense)
+    Write-Output "`n[+] [1/5] Hardening Machine Account Quota (NoPac Defense)..."
+    try {
+        Set-ADDomain -Identity (Get-ADDomain).DistinguishedName -Replace @{"ms-DS-MachineAccountQuota" = "0"} -ErrorAction Stop | Out-Null
+        Add-AuditEntry "Active Directory" "MachineAccountQuota" "Vulnerable (Default: 10)" "Set ms-DS-MachineAccountQuota to 0"
+        Write-Output "    -> ms-DS-MachineAccountQuota set to 0 (Standard users cannot add domain computers)."
+    } catch {
+        try {
+            $domainEntry = [ADSI]"LDAP://$domainDN"
+            $domainEntry.Put("ms-DS-MachineAccountQuota", 0)
+            $domainEntry.SetInfo()
+            Add-AuditEntry "Active Directory" "MachineAccountQuota" "Vulnerable (Default: 10)" "Set ms-DS-MachineAccountQuota to 0 (via ADSI)"
+            Write-Output "    -> ms-DS-MachineAccountQuota set to 0 (via ADSI)."
+        } catch {
+            Write-Output "    [-] Failed setting MachineAccountQuota: $_"
+        }
+    }
+
+    # 2. Harden Domain Password Policy (Safe for CCDC Scoring)
+    Write-Output "`n[+] [2/5] Applying Scoring-Safe Domain Password Policy..."
     try {
         Set-ADDefaultDomainPasswordPolicy -Identity (Get-ADDomain).DistinguishedName `
             -MinPasswordLength 14 `
@@ -169,8 +215,8 @@ function Invoke-GPOHardening {
         Write-Output "    [-] Error setting domain password policy: $_"
     }
 
-    # 2. Create or Reset Hardened Baseline GPO
-    Write-Output "`n[+] [2/4] Initializing Baseline GPO: '$GpoName'..."
+    # 3. Create or Reset Hardened Baseline GPO
+    Write-Output "`n[+] [3/5] Initializing Baseline GPO: '$GpoName'..."
     $gpo = Get-GPO -Name $GpoName -ErrorAction SilentlyContinue
     if (-not $gpo) {
         $gpo = New-GPO -Name $GpoName -Comment "CCDC Baseline Hardening Policy"
@@ -179,8 +225,8 @@ function Invoke-GPOHardening {
         Write-Output ("    -> Existing GPO found: " + $GpoName)
     }
 
-    # 3. Configure Safe Hardening Registry Entries inside the GPO
-    Write-Output "`n[+] [3/4] Writing Hardened Registry Policies to GPO..."
+    # 4. Configure Safe Hardening Registry Entries inside the GPO
+    Write-Output "`n[+] [4/5] Writing Hardened Registry Policies to GPO..."
 
     $regSettings = @(
         # --- RDP Hardening (Single Session, NLA) ---
@@ -306,8 +352,8 @@ function Invoke-GPOHardening {
         }
     }
 
-    # 4. Link & Enforce GPO at Domain Root
-    Write-Output "`n[+] [4/4] Linking GPO to Domain Root ($domainDN)..."
+    # 5. Link & Enforce GPO at Domain Root
+    Write-Output "`n[+] [5/5] Linking GPO to Domain Root ($domainDN)..."
     try {
         New-GPLink -Name $GpoName -Target $domainDN -Enforced Yes -ErrorAction SilentlyContinue | Out-Null
         Set-GPLink -Name $GpoName -Target $domainDN -Enforced Yes -Order 1 -ErrorAction SilentlyContinue | Out-Null
