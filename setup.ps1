@@ -30,7 +30,8 @@ $ScriptList = @(
     "secpol.ps1",
     "auditpost.ps1",
     "tools.ps1",
-    "thrunt.ps1"
+    "thrunt.ps1",
+    "usergroup.ps1"
 )
 
 function Sync-ScriptsFromGitHub {
