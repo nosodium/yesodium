@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Member Server (Borgar) Hardening, Persistence Purge, Discovery, & Rollback
+    Member Server (Borgar) Hardening, Persistence Purge, Discovery, Firewall Unlock & Rollback
 .DESCRIPTION
     Tailored for a domain-joined Windows Server 2022 application server.
     Pure ASCII. Compatible with PowerShell 5.1+.
@@ -209,7 +209,7 @@ function Invoke-SystemRestoration {
     }
     Write-Output "  [+] Registry keys and values reverted."
 
-    # 2. Restore NetBIOS (Fixed CIM method invocation)
+    # 2. Restore NetBIOS
     Write-Output "`n[*] Restoring NetBIOS Options on Network Interfaces..."
     $adapters = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction SilentlyContinue
     foreach ($nic in $adapters) {
@@ -293,7 +293,7 @@ function Invoke-HardeningSequence {
     Add-AuditEntry "Protocols" "SMB Packet Signing" "Not Enforced" "Enforced SMB security signature"
     Write-Output "    -> Disabled SMBv1 and enforced SMB Signing."
 
-    # 4. LLMNR & NetBIOS (Fixed CIM call)
+    # 4. LLMNR & NetBIOS
     Write-Output "[+] [4/6] Disabling LLMNR & NetBIOS (Responder Poisoning Defense)..."
     $dnsPolicy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
     if (-not (Test-Path $dnsPolicy)) { New-Item -Path $dnsPolicy -Force | Out-Null }
@@ -307,8 +307,8 @@ function Invoke-HardeningSequence {
     Add-AuditEntry "Protocols" "NetBIOS over TCP/IP" "Active on NICs" "Disabled NetBIOS across all active interfaces"
     Write-Output "    -> LLMNR and NetBIOS over TCP/IP disabled."
 
-    # 5. LSASS, Credential Dumping & RDP NLA
-    Write-Output "[+] [5/6] Hardening LSASS, Authentication, & RDP NLA..."
+    # 5. LSASS, RDP NLA & Firewall Local Admin Unlock
+    Write-Output "[+] [5/6] Hardening LSASS, RDP NLA, & Unlocking Local Firewall..."
     $lsaPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
     Set-ItemProperty -Path $lsaPath -Name "RunAsPPL" -Value 1 -Type DWord -Force
     $wdigestPath = "$lsaPath\SecurityProviders\WDigest"
@@ -325,8 +325,36 @@ function Invoke-HardeningSequence {
         Set-ItemProperty -Path $rdpPath -Name "UserAuthentication" -Value 1 -Type DWord -Force
         Add-AuditEntry "Remote Access" "RDP NLA" "Checked" "Enforced Network Level Authentication"
     }
+
+    # --- FIREWALL LOCAL ADMIN UNLOCK ---
+    netsh advfirewall set allprofiles settings localfirewallrules enable | Out-Null
+    netsh advfirewall set allprofiles settings localconsecrules enable | Out-Null
+    Set-NetFirewallProfile -Profile Domain,Public,Private -AllowLocalFirewallRules True -AllowLocalIPsecRules True -ErrorAction SilentlyContinue
+
+    $gpoFwPath = "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall"
+    foreach ($p in @("DomainProfile", "PrivateProfile", "PublicProfile", "StandardProfile")) {
+        $pPath = "$gpoFwPath\$p"
+        if (-not (Test-Path $pPath)) { New-Item -Path $pPath -Force | Out-Null }
+        Set-ItemProperty -Path $pPath -Name "AllowLocalPolicyMerge" -Value 1 -Type DWord -Force
+        Set-ItemProperty -Path $pPath -Name "AllowLocalIPsecPolicyMerge" -Value 1 -Type DWord -Force
+    }
+
+    # Anti-GPO overwrite lock: Deny SYSTEM permission to overwrite firewall merge settings
+    $acl = Get-Acl $gpoFwPath
+    $denyRule = New-Object System.Security.AccessControl.RegistryAccessRule(
+        "NT AUTHORITY\SYSTEM",
+        "SetValue,CreateSubKey,Delete",
+        "ContainerInherit,ObjectInherit",
+        "None",
+        "Deny"
+    )
+    $acl.AddAccessRule($denyRule)
+    Set-Acl -Path $gpoFwPath -AclObject $acl -ErrorAction SilentlyContinue
+
+    Add-AuditEntry "Firewall" "Local Rule Merging" "Locked by GPO" "Unlocked & Protected registry key from GPO overwrite"
     Add-AuditEntry "LSASS / Auth" "LSASS & NTLM" "Unprotected" "Enabled RunAsPPL, disabled WDigest, enforced NTLMv2"
     Write-Output "    -> Enabled RunAsPPL, disabled WDigest, enforced NTLMv2 & RDP NLA."
+    Write-Output "    -> Firewall unlocked: Local administrators have full control."
 
     # 6. Risky Services & Persistence Purge
     Write-Output "[+] [6/6] Disabling Risky Services & Purging Persistence..."
@@ -340,7 +368,7 @@ function Invoke-HardeningSequence {
         }
     }
 
-    # Purge Suspicious Scheduled Tasks (with proper TaskPath XML export)
+    # Purge Suspicious Scheduled Tasks
     $badKeywords = @("ithelp4", "shutdown", "curl", "powershell -enc", "wget", "wsl", "certutil -urlcache")
     $purgedTasksMeta = @()
     if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
